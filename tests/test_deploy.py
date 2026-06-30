@@ -281,3 +281,28 @@ def test_wait_until_ready_raises_on_failed_update() -> None:
             sleep=lambda _s: None,
             monotonic=FakeClock([0, 1]),
         )
+
+
+def test_wait_until_ready_raises_promptly_on_failed_ready_state() -> None:
+    # A terminal ready==FAILED state (config_update otherwise "settled") must fail
+    # fast rather than spinning until the timeout. The SDK enum has no FAILED member,
+    # so the failed ready state is represented by its string value.
+    failed = FakeEndpoint(
+        "multi-lora-vllm",
+        FakeState("FAILED", EndpointStateConfigUpdate.NOT_UPDATING),
+    )
+    client = SequenceClient([failed])
+    sleeps: list[float] = []
+
+    with pytest.raises(EndpointDeploymentError, match="deployment failed"):
+        _wait_until_ready(
+            client,  # type: ignore[arg-type]
+            "multi-lora-vllm",
+            timeout_s=10_000,  # huge: the test would hang/loop if we waited it out
+            sleep=sleeps.append,
+            monotonic=FakeClock([0, 1, 2]),
+        )
+
+    # Failed on the very first poll: no spinning, no sleeping.
+    assert client.calls == 1
+    assert sleeps == []

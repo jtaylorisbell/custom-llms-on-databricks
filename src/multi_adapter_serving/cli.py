@@ -29,8 +29,17 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any
 
+# DatabricksError is the base for all Databricks SDK service errors. Imported from
+# its defining module because the errors package __init__ does not re-export it in a
+# way the strict type checker treats as public.
+from databricks.sdk.errors.base import DatabricksError
+
 from multi_adapter_serving.config import Config, load_config
-from multi_adapter_serving.deploy import DeploymentResult, deploy_endpoint
+from multi_adapter_serving.deploy import (
+    DeploymentResult,
+    EndpointDeploymentError,
+    deploy_endpoint,
+)
 from multi_adapter_serving.model import log_and_register
 from multi_adapter_serving.smoke_test import smoke_test
 from multi_adapter_serving.staging import stage_weights
@@ -44,6 +53,17 @@ CANONICAL_STEPS: tuple[str, ...] = ("stage", "register", "deploy", "smoke")
 
 # Friendly aliases accepted in --steps for the smoke step.
 _STEP_ALIASES = {"smoke-test": "smoke", "smoketest": "smoke"}
+
+# Each step's required predecessor that must also be selected, so its output is
+# produced within the same run. Steps not listed have no in-run prerequisite
+# (``stage`` needs nothing; ``smoke`` can query a pre-existing endpoint).
+_STEP_REQUIRES = {"register": "stage", "deploy": "register"}
+
+# Process exit codes. Distinct codes let callers tell the failure modes apart.
+EXIT_OK = 0
+EXIT_SMOKE_FAILURE = 1  # pipeline ran, but >=1 adapter failed its smoke test
+EXIT_USAGE = 2  # bad arguments, bad config, or an incomplete --steps subset
+EXIT_OPERATIONAL = 3  # a step raised at runtime (deploy/register/stage/smoke)
 
 
 class CliError(Exception):
@@ -71,25 +91,37 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         steps = _resolve_steps(args.steps)
+        # Fail fast on an incomplete subset BEFORE any side-effecting step runs.
+        _validate_step_dependencies(steps)
     except CliError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
     except (FileNotFoundError, ValueError) as exc:
         print(f"error: failed to load config {args.config!r}: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
 
     if args.dry_run:
         _print_dry_run_plan(config, steps)
-        return 0
+        return EXIT_OK
 
     try:
         state = _run_steps(config, steps)
     except CliError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
+    except (EndpointDeploymentError, FileNotFoundError, DatabricksError) as exc:
+        # Expected operational failures: report concisely, no traceback.
+        print(f"error: pipeline step failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_OPERATIONAL
+    except Exception as exc:  # operational fallback: controlled exit, never a traceback
+        print(
+            f"error: unexpected failure during pipeline: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return EXIT_OPERATIONAL
 
     _print_summary(config, state)
-    return 0
+    return _exit_code_for_results(state)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -138,6 +170,38 @@ def _resolve_steps(steps_arg: str | None) -> list[str]:
     if not requested:
         raise CliError("--steps was given but contained no valid steps")
     return [step for step in CANONICAL_STEPS if step in requested]
+
+
+def _validate_step_dependencies(steps: list[str]) -> None:
+    """Reject an incomplete ``--steps`` subset before any side-effecting work.
+
+    A selected step whose output-producing predecessor is not also selected cannot
+    run (its input would be missing), so fail fast — e.g. ``--steps stage,deploy``
+    is rejected up front instead of staging real weights and then crashing.
+    """
+    selected = set(steps)
+    for step in steps:
+        required = _STEP_REQUIRES.get(step)
+        if required is not None and required not in selected:
+            raise CliError(
+                f"step {step!r} requires {required!r} in the same run; "
+                f"add it to --steps (e.g. --steps {required},{step})"
+            )
+
+
+def _exit_code_for_results(state: _PipelineState) -> int:
+    """Return a nonzero code if the smoke step ran and any adapter failed."""
+    if state.smoke_results:
+        failed = sorted(
+            adapter for adapter, result in state.smoke_results.items() if not result.get("ok")
+        )
+        if failed:
+            print(
+                f"smoke test: {len(failed)} adapter(s) failed: {', '.join(failed)}",
+                file=sys.stderr,
+            )
+            return EXIT_SMOKE_FAILURE
+    return EXIT_OK
 
 
 def _run_steps(config: Config, steps: list[str]) -> _PipelineState:

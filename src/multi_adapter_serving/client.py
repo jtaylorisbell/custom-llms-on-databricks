@@ -54,12 +54,27 @@ class QueryResult:
     raw: dict[str, Any]
 
 
+# Payload keys this module owns; callers may not override them via chat_kwargs,
+# otherwise the guaranteed {messages, custom_inputs.adapter} shape could be clobbered.
+_RESERVED_PAYLOAD_KEYS = ("messages", "custom_inputs")
+
+
 def build_payload(adapter: str, prompt: str, **chat_kwargs: Any) -> dict[str, Any]:
     """Build the ``llm/v1/chat`` request body for ``adapter`` + ``prompt``.
 
     The adapter is carried in ``custom_inputs.adapter`` (the proxy contract); any
     extra OpenAI-style chat parameters are passed through at the top level.
+
+    Raises:
+        ValueError: If ``chat_kwargs`` contains a reserved key (``messages`` or
+            ``custom_inputs``), which would clobber the constructed payload shape.
     """
+    clobbered = [key for key in _RESERVED_PAYLOAD_KEYS if key in chat_kwargs]
+    if clobbered:
+        raise ValueError(
+            f"chat_kwargs may not override reserved payload keys: {clobbered}; "
+            "pass the prompt/adapter via the positional arguments instead"
+        )
     return {
         "messages": [{"role": "user", "content": prompt}],
         "custom_inputs": {"adapter": adapter},
@@ -93,8 +108,10 @@ def query(
     Returns:
         A :class:`QueryResult` with the assistant ``text`` and the ``raw`` response.
     """
-    invoker = client if client is not None else _default_invoker(profile)
+    # Build (and validate) the payload first, so a bad kwarg fails before we
+    # construct a workspace client / attempt any auth.
     payload = build_payload(adapter, prompt, **chat_kwargs)
+    invoker = client if client is not None else _default_invoker(profile)
     raw = invoker(endpoint_name, payload)
     return QueryResult(text=_extract_text(raw), raw=raw)
 

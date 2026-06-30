@@ -179,6 +179,18 @@ multi-adapter-serve --config config.yaml --dry-run             # plan only, no r
 It prints a clear summary: the staged manifest, the registered model + version,
 the endpoint name + state, and per-adapter smoke results.
 
+An incomplete `--steps` subset (e.g. `stage,deploy` without `register`) is
+rejected **up front** — before any weights are staged — and each step's runtime
+failures produce a concise, controlled error (no traceback). Exit codes are
+distinct so callers can tell the failure modes apart:
+
+| exit code | meaning                                                       |
+| --------- | ------------------------------------------------------------- |
+| `0`       | success                                                       |
+| `1`       | pipeline ran, but at least one adapter failed its smoke test  |
+| `2`       | usage error: bad arguments/config or an incomplete `--steps`  |
+| `3`       | operational error: a step (stage/register/deploy/smoke) raised|
+
 ## Quality gates
 
 ```bash

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from multi_adapter_serving.client import build_payload, query
 
 
@@ -21,6 +23,28 @@ def test_build_payload_shape() -> None:
         "temperature": 0.2,
         "max_tokens": 64,
     }
+
+
+def test_build_payload_rejects_reserved_kwargs() -> None:
+    # A caller must not clobber the keys this module owns.
+    with pytest.raises(ValueError, match="reserved payload keys"):
+        build_payload("ner", "hi", messages=[{"role": "user", "content": "x"}])
+    with pytest.raises(ValueError, match="reserved payload keys"):
+        build_payload("ner", "hi", custom_inputs={"adapter": "other"})
+
+
+def test_query_rejects_reserved_kwargs_before_calling_client() -> None:
+    calls: list[Any] = []
+
+    def spy_client(endpoint_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        calls.append(payload)
+        return {}
+
+    with pytest.raises(ValueError, match="reserved payload keys"):
+        query("ep", "ner", "hi", client=spy_client, custom_inputs={"adapter": "evil"})
+
+    # Rejected before the endpoint was ever invoked.
+    assert calls == []
 
 
 def test_query_sends_exact_payload_and_returns_text() -> None:

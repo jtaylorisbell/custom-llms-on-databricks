@@ -56,6 +56,12 @@ _FAILED_UPDATES = frozenset(
 # Config-update states compatible with a fully-rolled-out READY endpoint.
 _SETTLED_UPDATES = frozenset({None, EndpointStateConfigUpdate.NOT_UPDATING})
 
+# Ready-state values that mean the endpoint has terminally failed and will never
+# become healthy. ``EndpointStateReady`` does not define ``FAILED`` in every SDK
+# version, so we match on the string value defensively (rather than an enum member
+# that may not exist), keeping this robust across SDK versions.
+_FAILED_READY_VALUES = frozenset({"FAILED"})
+
 
 class EndpointDeploymentError(RuntimeError):
     """Raised when a serving endpoint deployment fails or times out."""
@@ -232,11 +238,15 @@ def _wait_until_ready(
         state = endpoint.state
         config_update = state.config_update if state is not None else None
         ready = state.ready if state is not None else None
+        ready_value = _enum_value(ready)
 
-        if config_update in _FAILED_UPDATES:
+        # Terminal failure: a failed config update OR a failed ready state. Both
+        # mean the endpoint will never become healthy, so fail fast rather than
+        # spinning until the timeout.
+        if config_update in _FAILED_UPDATES or ready_value in _FAILED_READY_VALUES:
             raise EndpointDeploymentError(
                 f"serving endpoint {endpoint_name!r} deployment failed: "
-                f"config_update={_enum_value(config_update)}"
+                f"ready={ready_value}, config_update={_enum_value(config_update)}"
             )
         if ready == EndpointStateReady.READY and config_update in _SETTLED_UPDATES:
             logger.info("Serving endpoint %r is READY", endpoint_name)

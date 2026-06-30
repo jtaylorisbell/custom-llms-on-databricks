@@ -43,12 +43,30 @@ def make_config(**overrides: Any) -> Config:
     return Config.model_validate(data)
 
 
-class Recorder:
-    """Monkeypatches the four pipeline functions, recording calls + ordering."""
+# All adapters pass by default, so the happy-path pipeline exits 0.
+_ALL_PASS_SMOKE = {"ner": {"ok": True, "snippet": "hi"}, "code": {"ok": True, "snippet": "ok"}}
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+
+class Recorder:
+    """Monkeypatches the four pipeline functions, recording calls + ordering.
+
+    Optionally configurable to make one step raise (``fail_step``/``fail_exc``) or to
+    return specific smoke results (``smoke_results``).
+    """
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        smoke_results: dict[str, dict[str, Any]] | None = None,
+        fail_step: str | None = None,
+        fail_exc: Exception | None = None,
+    ) -> None:
         self.order: list[str] = []
         self.calls: dict[str, Any] = {}
+        self._smoke_results = smoke_results if smoke_results is not None else dict(_ALL_PASS_SMOKE)
+        self._fail_step = fail_step
+        self._fail_exc = fail_exc if fail_exc is not None else RuntimeError("boom")
 
         monkeypatch.setattr(cli, "load_config", lambda path: make_config())
         monkeypatch.setattr(cli, "stage_weights", self._stage)
@@ -56,15 +74,20 @@ class Recorder:
         monkeypatch.setattr(cli, "deploy_endpoint", self._deploy)
         monkeypatch.setattr(cli, "smoke_test", self._smoke)
 
+    def _maybe_fail(self, step: str) -> None:
+        if self._fail_step == step:
+            raise self._fail_exc
+
     def _stage(self, config: Config) -> dict[str, str]:
         self.order.append("stage")
-        manifest = {"base": "/Volumes/x/base", "ner": "/Volumes/x/ner", "code": "/Volumes/x/code"}
         self.calls["stage"] = {"config": config}
-        return manifest
+        self._maybe_fail("stage")
+        return {"base": "/Volumes/x/base", "ner": "/Volumes/x/ner", "code": "/Volumes/x/code"}
 
     def _register(self, config: Config, manifest: dict[str, str]) -> tuple[str, int]:
         self.order.append("register")
         self.calls["register"] = {"manifest": manifest}
+        self._maybe_fail("register")
         return "classic_stable_h0vpq7_catalog.default.multi_lora_vllm", 7
 
     def _deploy(
@@ -72,6 +95,7 @@ class Recorder:
     ) -> DeploymentResult:
         self.order.append("deploy")
         self.calls["deploy"] = {"name": model_full_name, "version": model_version}
+        self._maybe_fail("deploy")
         return DeploymentResult(
             endpoint_name="multi-lora-vllm",
             action="created",
@@ -83,7 +107,8 @@ class Recorder:
     def _smoke(self, config: Config) -> dict[str, dict[str, Any]]:
         self.order.append("smoke")
         self.calls["smoke"] = {"config": config}
-        return {"ner": {"ok": True, "snippet": "hi"}, "code": {"ok": False, "error": "boom"}}
+        self._maybe_fail("smoke")
+        return self._smoke_results
 
 
 def test_full_pipeline_runs_all_steps_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -91,7 +116,7 @@ def test_full_pipeline_runs_all_steps_in_order(monkeypatch: pytest.MonkeyPatch) 
 
     rc = cli.main(["--config", "config.yaml"])
 
-    assert rc == 0
+    assert rc == cli.EXIT_OK
     assert rec.order == ["stage", "register", "deploy", "smoke"]
     # Output wiring: stage's manifest -> register; register's name+version -> deploy.
     assert rec.calls["register"]["manifest"] == {
@@ -108,7 +133,7 @@ def test_steps_subset_runs_only_requested(monkeypatch: pytest.MonkeyPatch) -> No
 
     rc = cli.main(["--config", "config.yaml", "--steps", "stage,register"])
 
-    assert rc == 0
+    assert rc == cli.EXIT_OK
     assert rec.order == ["stage", "register"]
     assert "deploy" not in rec.calls
     assert "smoke" not in rec.calls
@@ -120,7 +145,7 @@ def test_steps_reordered_to_canonical_order(monkeypatch: pytest.MonkeyPatch) -> 
     # Request out of order; smoke has no prerequisite, so stage+smoke is valid.
     rc = cli.main(["--config", "config.yaml", "--steps", "smoke,stage"])
 
-    assert rc == 0
+    assert rc == cli.EXIT_OK
     assert rec.order == ["stage", "smoke"]
 
 
@@ -129,7 +154,7 @@ def test_smoke_only_needs_no_prerequisite(monkeypatch: pytest.MonkeyPatch) -> No
 
     rc = cli.main(["--config", "config.yaml", "--steps", "smoke-test"])
 
-    assert rc == 0
+    assert rc == cli.EXIT_OK
     assert rec.order == ["smoke"]
 
 
@@ -138,7 +163,7 @@ def test_dry_run_makes_no_real_calls(monkeypatch: pytest.MonkeyPatch) -> None:
 
     rc = cli.main(["--config", "config.yaml", "--dry-run"])
 
-    assert rc == 0
+    assert rc == cli.EXIT_OK
     # None of the four pipeline functions were invoked.
     assert rec.order == []
     assert rec.calls == {}
@@ -149,8 +174,9 @@ def test_deploy_without_register_errors(monkeypatch: pytest.MonkeyPatch) -> None
 
     rc = cli.main(["--config", "config.yaml", "--steps", "deploy"])
 
-    # Missing prerequisite (no registered version) is a clean error, not a crash.
-    assert rc == 2
+    # Missing prerequisite (no registered version) is a clean error, not a crash,
+    # and is caught up front before any step runs.
+    assert rc == cli.EXIT_USAGE
     assert rec.order == []
 
 
@@ -159,7 +185,7 @@ def test_unknown_step_errors(monkeypatch: pytest.MonkeyPatch) -> None:
 
     rc = cli.main(["--config", "config.yaml", "--steps", "bogus"])
 
-    assert rc == 2
+    assert rc == cli.EXIT_USAGE
 
 
 def test_bad_config_path_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,4 +196,96 @@ def test_bad_config_path_errors(monkeypatch: pytest.MonkeyPatch) -> None:
 
     rc = cli.main(["--config", "missing.yaml"])
 
-    assert rc == 2
+    assert rc == cli.EXIT_USAGE
+
+
+# --- BLOCKING 2: smoke-failure exit code ------------------------------------------
+
+
+def test_smoke_failure_returns_nonzero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = Recorder(
+        monkeypatch,
+        smoke_results={
+            "ner": {"ok": True, "snippet": "hi"},
+            "code": {"ok": False, "error": "upstream 500"},
+        },
+    )
+
+    rc = cli.main(["--config", "config.yaml"])
+
+    # The whole pipeline ran, but a failing adapter yields a nonzero exit code.
+    assert rec.order == ["stage", "register", "deploy", "smoke"]
+    assert rc == cli.EXIT_SMOKE_FAILURE
+    assert rc != cli.EXIT_OK
+    err = capsys.readouterr().err
+    assert "code" in err  # the failing adapter is named on stderr
+
+
+def test_smoke_all_pass_returns_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recorder(
+        monkeypatch,
+        smoke_results={"ner": {"ok": True, "snippet": "a"}, "code": {"ok": True, "snippet": "b"}},
+    )
+
+    rc = cli.main(["--config", "config.yaml", "--steps", "smoke"])
+
+    assert rec.order == ["smoke"]
+    assert rc == cli.EXIT_OK
+
+
+# --- BLOCKING 3: operational errors -> controlled exit, no traceback ---------------
+
+
+def test_operational_failure_is_controlled_exit_without_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from multi_adapter_serving.deploy import EndpointDeploymentError
+
+    rec = Recorder(
+        monkeypatch,
+        fail_step="deploy",
+        fail_exc=EndpointDeploymentError("endpoint 'multi-lora-vllm' deployment failed"),
+    )
+
+    rc = cli.main(["--config", "config.yaml"])
+
+    # Reached deploy, which raised; smoke never ran.
+    assert rec.order == ["stage", "register", "deploy"]
+    assert rc == cli.EXIT_OPERATIONAL
+    captured = capsys.readouterr()
+    # Concise message on stderr, and crucially NO Python traceback leaked.
+    assert "deployment failed" in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
+
+
+def test_unexpected_step_error_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A non-Databricks runtime error still results in a controlled operational exit.
+    rec = Recorder(monkeypatch, fail_step="stage", fail_exc=RuntimeError("disk full"))
+
+    rc = cli.main(["--config", "config.yaml", "--steps", "stage"])
+
+    assert rec.order == ["stage"]
+    assert rc == cli.EXIT_OPERATIONAL
+
+
+# --- HARDENING B: invalid --steps subset fails fast, no side effects ---------------
+
+
+def test_invalid_subset_fails_fast_with_no_side_effects(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = Recorder(monkeypatch)
+
+    # deploy needs register in the same run; with only stage+deploy selected this is
+    # rejected BEFORE staging real weights.
+    rc = cli.main(["--config", "config.yaml", "--steps", "stage,deploy"])
+
+    assert rc == cli.EXIT_USAGE
+    # No step ran at all — in particular, stage did not download/upload anything.
+    assert rec.order == []
+    assert rec.calls == {}
+    err = capsys.readouterr().err
+    assert "requires" in err and "register" in err
