@@ -6,12 +6,19 @@ with no Hugging Face or Databricks access.
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, BinaryIO
 
 import pytest
+from databricks.sdk.errors import NotFound
 
 from multi_adapter_serving.config import Config
-from multi_adapter_serving.staging import stage_weights
+from multi_adapter_serving.staging import (
+    _make_uc_existence_checker,
+    _make_uc_uploader,
+    _parent_dir,
+    stage_weights,
+)
 
 UC_PREFIX = "/Volumes/classic_stable_h0vpq7_catalog/default/weights/multi_lora_vllm"
 
@@ -207,3 +214,138 @@ def test_dry_run_local_plan_passes_through_uc(caplog: pytest.LogCaptureFixture) 
         "base": f"{UC_PREFIX}/base",
         "adapter_a": existing_uc,
     }
+
+
+class FakeFilesClient:
+    """Records Databricks SDK ``files`` calls for the default uploader/checker."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+        self.existing_files: set[str] = set()
+        self.existing_dirs: set[str] = set()
+
+    def create_directory(self, directory_path: str) -> object:
+        self.events.append(("mkdir", directory_path))
+        return None
+
+    def upload(
+        self, file_path: str, contents: BinaryIO, *, overwrite: bool | None = None
+    ) -> object:
+        self.events.append(("upload", file_path))
+        return None
+
+    def get_metadata(self, file_path: str) -> object:
+        if file_path not in self.existing_files:
+            raise NotFound(f"no such file: {file_path}")
+        return object()
+
+    def get_directory_metadata(self, directory_path: str) -> object:
+        if directory_path not in self.existing_dirs:
+            raise NotFound(f"no such directory: {directory_path}")
+        return object()
+
+
+def test_default_uploader_creates_parent_dirs_for_nested_tree(tmp_path: Path) -> None:
+    # Build a snapshot-like tree with nested subdirectories.
+    source = tmp_path / "snapshot"
+    (source / "sub" / "deep").mkdir(parents=True)
+    (source / "config.json").write_text("{}", encoding="utf-8")
+    (source / "sub" / "nested.bin").write_text("x", encoding="utf-8")
+    (source / "sub" / "deep" / "weights.safetensors").write_text("y", encoding="utf-8")
+
+    fake = FakeFilesClient()
+    uploader = _make_uc_uploader("fevm-aws", files_client=fake)
+
+    target_root = f"{UC_PREFIX}/base"
+    uploader(str(source), target_root)
+
+    uploads = [path for kind, path in fake.events if kind == "upload"]
+    assert sorted(uploads) == [
+        f"{target_root}/config.json",
+        f"{target_root}/sub/deep/weights.safetensors",
+        f"{target_root}/sub/nested.bin",
+    ]
+
+    # Every upload must be preceded by a create_directory of its parent.
+    for index, (kind, path) in enumerate(fake.events):
+        if kind != "upload":
+            continue
+        parent = _parent_dir(path)
+        prior_mkdirs = [
+            p for k, p in fake.events[:index] if k == "mkdir" and p == parent
+        ]
+        assert prior_mkdirs, f"parent {parent} not created before uploading {path}"
+
+    # The intermediate (nested) parent directories were created.
+    created = {p for k, p in fake.events if k == "mkdir"}
+    assert f"{target_root}/sub" in created
+    assert f"{target_root}/sub/deep" in created
+
+
+def test_default_uploader_single_file_lands_at_target_root(tmp_path: Path) -> None:
+    source = tmp_path / "adapter_model.safetensors"
+    source.write_text("weights", encoding="utf-8")
+
+    fake = FakeFilesClient()
+    uploader = _make_uc_uploader("fevm-aws", files_client=fake)
+
+    target_root = f"{UC_PREFIX}/adapters/code"
+    uploader(str(source), target_root)
+
+    # The artifact lands exactly at target_root (the manifest path), not at
+    # target_root/<filename>, and its parent directory is created first.
+    assert ("upload", target_root) in fake.events
+    uploads = [path for kind, path in fake.events if kind == "upload"]
+    assert uploads == [target_root]
+    assert ("mkdir", _parent_dir(target_root)) in fake.events
+
+
+def test_default_uploader_single_file_matches_manifest(tmp_path: Path) -> None:
+    # When stage_weights uses the default uploader, the manifest path equals the
+    # real upload destination for a single-file artifact.
+    source = tmp_path / "adapter_model.safetensors"
+    source.write_text("weights", encoding="utf-8")
+
+    fake = FakeFilesClient()
+    config = make_config(
+        source_type="local",
+        base_model={"ref": str(source)},
+        adapters=[{"name": "only", "ref": str(source)}],
+    )
+    manifest = stage_weights(
+        config,
+        uploader=_make_uc_uploader("fevm-aws", files_client=fake),
+        local_path_exists=lambda _p: True,
+        uc_path_exists=lambda _p: True,
+    )
+
+    uploaded = [path for kind, path in fake.events if kind == "upload"]
+    assert manifest["base"] in uploaded
+    assert manifest["only"] in uploaded
+
+
+def test_default_existence_checker_true_for_file_path() -> None:
+    fake = FakeFilesClient()
+    file_path = "/Volumes/c/s/v/m/adapters/code/adapter_model.safetensors"
+    fake.existing_files.add(file_path)  # exists as a FILE, not a directory
+
+    checker = _make_uc_existence_checker("fevm-aws", files_client=fake)
+
+    assert checker(file_path) is True
+
+
+def test_default_existence_checker_true_for_directory_path() -> None:
+    fake = FakeFilesClient()
+    dir_path = "/Volumes/c/s/v/m/base"
+    fake.existing_dirs.add(dir_path)
+
+    checker = _make_uc_existence_checker("fevm-aws", files_client=fake)
+
+    assert checker(dir_path) is True
+
+
+def test_default_existence_checker_false_when_missing() -> None:
+    fake = FakeFilesClient()
+    checker = _make_uc_existence_checker("fevm-aws", files_client=fake)
+
+    assert checker("/Volumes/c/s/v/m/missing") is False

@@ -59,6 +59,24 @@ class UCUploader(Protocol):
 PathChecker = Callable[[str], bool]
 
 
+class _UCFilesClient(Protocol):
+    """The subset of the Databricks SDK ``WorkspaceClient.files`` API we use.
+
+    Captured as a Protocol so the default uploader / existence checker can be unit
+    tested with an injected fake instead of a real ``WorkspaceClient``.
+    """
+
+    def create_directory(self, directory_path: str) -> object: ...
+
+    def upload(
+        self, file_path: str, contents: BinaryIO, *, overwrite: bool | None = None
+    ) -> object: ...
+
+    def get_metadata(self, file_path: str) -> object: ...
+
+    def get_directory_metadata(self, directory_path: str) -> object: ...
+
+
 @dataclass(frozen=True)
 class _StageItem:
     """One unit of work: a logical weight name, its source ref, and its UC target."""
@@ -231,45 +249,70 @@ def _default_downloader(repo_id: str, *, local_dir: str, token: str | None) -> s
     return snapshot_download(repo_id=repo_id, local_dir=local_dir, token=token)
 
 
-def _make_uc_uploader(profile: str) -> UCUploader:
-    """Build a UC uploader using the Databricks SDK (OAuth via ``profile``)."""
+def _default_files_client(profile: str) -> _UCFilesClient:
+    """The real Databricks SDK files client (OAuth via ``profile``)."""
     from databricks.sdk import WorkspaceClient
 
-    client = WorkspaceClient(profile=profile)
+    return WorkspaceClient(profile=profile).files
+
+
+def _parent_dir(path: str) -> str:
+    """Parent directory of a UC Volume path (``mkdir -p`` target for the file)."""
+    parent, _, _ = path.rstrip("/").rpartition("/")
+    return parent or "/"
+
+
+def _upload_one(client: _UCFilesClient, local_file: Path, destination: str) -> None:
+    """Upload a single file, first ensuring its parent UC directory exists."""
+    # create_directory is idempotent and creates intermediate parents, so doing
+    # this per-file makes nested directory trees (e.g. .cache/huggingface/...) work.
+    client.create_directory(_parent_dir(destination))
+    with local_file.open("rb") as handle:
+        contents: BinaryIO = handle
+        client.upload(destination, contents, overwrite=True)
+
+
+def _make_uc_uploader(profile: str, *, files_client: _UCFilesClient | None = None) -> UCUploader:
+    """Build a UC uploader using the Databricks SDK (OAuth via ``profile``)."""
+    client = files_client if files_client is not None else _default_files_client(profile)
 
     def _upload(local_path: str, volume_path: str) -> None:
         source = Path(local_path)
         target_root = volume_path.rstrip("/")
-        client.files.create_directory(target_root)
         if source.is_file():
-            files = [source]
-        else:
-            files = sorted(p for p in source.rglob("*") if p.is_file())
-        for file_path in files:
-            if source.is_file():
-                relative = file_path.name
-            else:
-                relative = file_path.relative_to(source).as_posix()
-            destination = f"{target_root}/{relative}"
-            with file_path.open("rb") as handle:
-                contents: BinaryIO = handle
-                client.files.upload(destination, contents, overwrite=True)
+            # A single-file artifact lands AT target_root, so the staged path equals
+            # the manifest path returned by stage_weights().
+            _upload_one(client, source, target_root)
+            return
+        # A directory artifact is mirrored under target_root (which is itself the
+        # manifest path); each file gets its parent directory created first.
+        for file_path in sorted(p for p in source.rglob("*") if p.is_file()):
+            relative = file_path.relative_to(source).as_posix()
+            _upload_one(client, file_path, f"{target_root}/{relative}")
 
     return _upload
 
 
-def _make_uc_existence_checker(profile: str) -> PathChecker:
+def _make_uc_existence_checker(
+    profile: str, *, files_client: _UCFilesClient | None = None
+) -> PathChecker:
     """Build a UC existence checker using the Databricks SDK (OAuth via ``profile``)."""
-    from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors import NotFound
 
-    client = WorkspaceClient(profile=profile)
+    client = files_client if files_client is not None else _default_files_client(profile)
 
     def _exists(volume_path: str) -> bool:
+        # A passed-through ref may point at either a directory or a single file, so
+        # check both; only when neither exists do we treat the path as missing.
         try:
-            client.files.get_directory_metadata(volume_path)
+            client.get_directory_metadata(volume_path)
+            return True
+        except NotFound:
+            pass
+        try:
+            client.get_metadata(volume_path)
+            return True
         except NotFound:
             return False
-        return True
 
     return _exists

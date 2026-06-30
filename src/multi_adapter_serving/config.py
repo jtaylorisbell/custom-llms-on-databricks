@@ -39,6 +39,14 @@ SourceType = Literal["huggingface", "local"]
 VLLMDtype = Literal["auto", "half", "bfloat16", "float16", "float32"]
 
 
+def _stripped_non_empty(value: str) -> str:
+    """Strip surrounding whitespace and reject blank (whitespace-only) values."""
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("must be a non-empty string")
+    return stripped
+
+
 class BaseModelSpec(BaseModel):
     """Reference to the base model weights."""
 
@@ -49,6 +57,11 @@ class BaseModelSpec(BaseModel):
         min_length=1,
         description="HF repo id or local/UC-Volume path to the base model.",
     )
+
+    @field_validator("ref")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        return _stripped_non_empty(value)
 
 
 class Adapter(BaseModel):
@@ -69,30 +82,32 @@ class Adapter(BaseModel):
 
     @field_validator("name", "ref")
     @classmethod
-    def _strip_non_empty(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("must be a non-empty string")
-        return stripped
+    def _strip(cls, value: str) -> str:
+        return _stripped_non_empty(value)
 
 
 class UnityCatalogConfig(BaseModel):
     """Unity Catalog destination for staged weights and the registered model."""
 
     # ``schema`` shadows a deprecated ``BaseModel`` attribute, so it is exposed under
-    # the python attribute ``db_schema`` while keeping the YAML key ``schema``.
-    # ``model_name`` collides with pydantic's protected ``model_`` namespace, which we
-    # disable here.
+    # the python attribute ``db_schema`` while keeping the YAML key exactly ``schema``.
+    # ``populate_by_name`` is intentionally NOT set: the contract key must be ``schema``
+    # (the python name ``db_schema`` is rejected as an unknown field). ``model_name``
+    # collides with pydantic's protected ``model_`` namespace, which we disable here.
     model_config = ConfigDict(
         extra="forbid",
         protected_namespaces=(),
-        populate_by_name=True,
     )
 
     catalog: str = Field(..., min_length=1)
     db_schema: str = Field(..., min_length=1, alias="schema")
     model_name: str = Field(..., min_length=1)
     volume: str = Field(..., min_length=1)
+
+    @field_validator("catalog", "db_schema", "model_name", "volume")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        return _stripped_non_empty(value)
 
 
 class ServingConfig(BaseModel):
@@ -104,6 +119,11 @@ class ServingConfig(BaseModel):
     workload_type: str = Field(..., min_length=1)
     workload_size: str = Field(..., min_length=1)
     scale_to_zero: bool
+
+    @field_validator("endpoint_name", "workload_type", "workload_size")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        return _stripped_non_empty(value)
 
 
 class VLLMConfig(BaseModel):
@@ -126,6 +146,11 @@ class DatabricksConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     profile: str = Field(..., min_length=1)
+
+    @field_validator("profile")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        return _stripped_non_empty(value)
 
 
 class Config(BaseModel):

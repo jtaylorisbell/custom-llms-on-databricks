@@ -193,3 +193,41 @@ def test_shipped_example_config_loads() -> None:
     assert config.base_model.ref == "mistralai/Mistral-7B-Instruct-v0.2"
     assert [a.name for a in config.adapters] == ["ner", "code"]
     assert config.vllm.dtype == "half"
+
+
+def test_unity_catalog_schema_key_accepted(tmp_path: Path) -> None:
+    config = load_config(write_yaml(tmp_path, valid_config_dict()))
+    assert config.unity_catalog.db_schema == "default"
+
+
+def test_unity_catalog_db_schema_key_rejected(tmp_path: Path) -> None:
+    # The contract key must be exactly `schema`; the python name `db_schema` is
+    # not an accepted input key (populate_by_name is off, extra is forbidden).
+    data = valid_config_dict()
+    uc = data["unity_catalog"]
+    uc["db_schema"] = uc.pop("schema")
+    with pytest.raises(ValidationError):
+        load_config(write_yaml(tmp_path, data))
+
+
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("base_model", "ref"),
+        ("unity_catalog", "catalog"),
+        ("unity_catalog", "schema"),
+        ("unity_catalog", "model_name"),
+        ("unity_catalog", "volume"),
+        ("serving", "endpoint_name"),
+        ("serving", "workload_type"),
+        ("serving", "workload_size"),
+        ("databricks", "profile"),
+    ],
+)
+def test_whitespace_only_string_fields_rejected(
+    tmp_path: Path, section: str, key: str
+) -> None:
+    data = valid_config_dict()
+    data[section][key] = "   "
+    with pytest.raises(ValidationError):
+        load_config(write_yaml(tmp_path, data))
