@@ -1494,11 +1494,14 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "databricks-sdk" },
+    { name = "fastapi" },
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "mlflow" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "transformers" },
+    { name = "uvicorn" },
     { name = "vllm", marker = "sys_platform == 'linux'" },
 ]
 
@@ -1513,11 +1516,14 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "databricks-sdk", specifier = ">=0.102.0" },
+    { name = "fastapi", specifier = ">=0.138.0" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "huggingface-hub", specifier = ">=0.34.0,<1.0" },
     { name = "mlflow", specifier = "==3.12.0" },
     { name = "pydantic", specifier = ">=2" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "transformers", specifier = "==4.57.6" },
+    { name = "uvicorn", specifier = ">=0.49.0" },
     { name = "vllm", marker = "sys_platform == 'linux'", specifier = "==0.11.2" },
 ]
 
