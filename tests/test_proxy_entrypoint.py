@@ -8,6 +8,7 @@ import pytest
 from multi_adapter_serving.serving import proxy_entrypoint as pe
 from multi_adapter_serving.serving.proxy_entrypoint import (
     build_vllm_command,
+    monitor_vllm,
     parse_adapter_names,
     parse_args,
     wait_for_vllm_ready,
@@ -124,3 +125,36 @@ def test_wait_times_out_when_never_ready(monkeypatch: pytest.MonkeyPatch) -> Non
             sleep=_sleep,
             now=_now,
         )
+
+
+class FakeServer:
+    """Minimal uvicorn.Server stand-in exposing a settable should_exit flag."""
+
+    def __init__(self) -> None:
+        self.should_exit = False
+
+
+def test_monitor_requests_shutdown_when_vllm_dies() -> None:
+    # poll() is None twice (alive), then returns a non-zero exit code (crashed).
+    process = FakeProcess([None, None, 1])
+    server = FakeServer()
+
+    exit_code = monitor_vllm(
+        process, server, poll_interval_s=0.0, sleep=lambda _s: None
+    )
+
+    # The monitor asked the proxy server to shut down and surfaced the crash code.
+    assert server.should_exit is True
+    assert exit_code == 1
+
+
+def test_monitor_returns_none_when_server_already_exiting() -> None:
+    # If the server is already shutting down (e.g. a signal), the monitor does not
+    # treat it as a vLLM crash.
+    process = FakeProcess([None])
+    server = FakeServer()
+    server.should_exit = True
+
+    exit_code = monitor_vllm(process, server, sleep=lambda _s: None)
+
+    assert exit_code is None

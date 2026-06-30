@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 __all__ = [
     "UpstreamClient",
     "UpstreamResponse",
+    "UpstreamStream",
     "create_proxy_app",
 ]
 
@@ -46,6 +47,34 @@ class UpstreamResponse:
     status_code: int
     content: bytes
     media_type: str | None = None
+
+
+class UpstreamStream(Protocol):
+    """An opened upstream streaming response.
+
+    Exposes the *pre-stream* status code and content-type (available as soon as the
+    response head is received) so the proxy can decide whether to pass the response
+    through as an SSE stream (2xx) or surface an upstream error verbatim (non-2xx),
+    instead of mislabeling a failure as a successful event-stream.
+    """
+
+    @property
+    def status_code(self) -> int: ...
+
+    @property
+    def media_type(self) -> str | None: ...
+
+    async def aread(self) -> bytes:
+        """Read and return the full response body (used for error passthrough)."""
+        ...
+
+    def aiter_bytes(self) -> AsyncIterator[bytes]:
+        """Iterate the response body in chunks (used for the SSE passthrough)."""
+        ...
+
+    async def aclose(self) -> None:
+        """Release the underlying upstream connection."""
+        ...
 
 
 class UpstreamClient(Protocol):
@@ -63,9 +92,38 @@ class UpstreamClient(Protocol):
         """Forward a (non-streaming) chat completion request and return the reply."""
         ...
 
-    def stream_chat_completions(self, body: dict[str, Any]) -> AsyncIterator[bytes]:
-        """Forward a streaming chat completion request, yielding raw SSE bytes."""
+    async def open_chat_stream(self, body: dict[str, Any]) -> UpstreamStream:
+        """Open a streaming chat completion and return the response handle.
+
+        The handle's ``status_code``/``media_type`` reflect the upstream response
+        head, so the caller can surface pre-stream errors instead of streaming them.
+        """
         ...
+
+
+class _HttpxUpstreamStream:
+    """:class:`UpstreamStream` backed by an open ``httpx`` streaming response."""
+
+    def __init__(self, response: httpx.Response) -> None:
+        self._response = response
+
+    @property
+    def status_code(self) -> int:
+        return self._response.status_code
+
+    @property
+    def media_type(self) -> str | None:
+        content_type: str | None = self._response.headers.get("content-type")
+        return content_type
+
+    async def aread(self) -> bytes:
+        return await self._response.aread()
+
+    def aiter_bytes(self) -> AsyncIterator[bytes]:
+        return self._response.aiter_bytes()
+
+    async def aclose(self) -> None:
+        await self._response.aclose()
 
 
 class _HttpxUpstream:
@@ -95,10 +153,12 @@ class _HttpxUpstream:
             media_type=response.headers.get("content-type"),
         )
 
-    async def stream_chat_completions(self, body: dict[str, Any]) -> AsyncIterator[bytes]:
-        async with self._client.stream("POST", self._chat_url, json=body) as response:
-            async for chunk in response.aiter_bytes():
-                yield chunk
+    async def open_chat_stream(self, body: dict[str, Any]) -> UpstreamStream:
+        # Send with stream=True so the response head (status + content-type) is
+        # available before the body is consumed; the caller closes the handle.
+        request = self._client.build_request("POST", self._chat_url, json=body)
+        response = await self._client.send(request, stream=True)
+        return _HttpxUpstreamStream(response)
 
 
 def _translate(body: Mapping[str, Any], allowlist: frozenset[str]) -> dict[str, Any]:
@@ -140,6 +200,14 @@ def _translate(body: Mapping[str, Any], allowlist: frozenset[str]) -> dict[str, 
             status_code=400,
             detail="missing adapter: set custom_inputs.adapter (or a top-level adapter)",
         )
+    # Guard the allowlist membership test: a non-string adapter (list/dict) is
+    # unhashable and would raise TypeError -> HTTP 500. A malformed adapter is a
+    # client error, so reject it (and empty strings) with 400 per the contract.
+    if not isinstance(adapter, str) or not adapter:
+        raise HTTPException(
+            status_code=400,
+            detail=f"adapter must be a non-empty string, got {adapter!r}",
+        )
     if adapter not in allowlist:
         raise HTTPException(
             status_code=400,
@@ -148,6 +216,46 @@ def _translate(body: Mapping[str, Any], allowlist: frozenset[str]) -> dict[str, 
 
     forwarded["model"] = adapter
     return forwarded
+
+
+def _is_success(status_code: int) -> bool:
+    return 200 <= status_code < 300
+
+
+async def _stream_or_error(upstream: UpstreamClient, body: dict[str, Any]) -> Response:
+    """Open the upstream stream; pass 2xx through as SSE, surface errors verbatim.
+
+    A vLLM pre-stream failure (e.g. 4xx/5xx before any tokens) must not be returned
+    as a 200 event-stream. We inspect the upstream response head: non-2xx responses
+    are returned verbatim (status, body, content-type); only a 2xx is streamed.
+    """
+    stream = await upstream.open_chat_stream(body)
+
+    if not _is_success(stream.status_code):
+        try:
+            error_body = await stream.aread()
+        finally:
+            await stream.aclose()
+        return Response(
+            content=error_body,
+            status_code=stream.status_code,
+            media_type=stream.media_type,
+        )
+
+    async def _passthrough() -> AsyncIterator[bytes]:
+        # Keep the upstream connection open while FastAPI drains the body, then
+        # close it. Mid-stream failures after headers are sent flow through as-is.
+        try:
+            async for chunk in stream.aiter_bytes():
+                yield chunk
+        finally:
+            await stream.aclose()
+
+    return StreamingResponse(
+        _passthrough(),
+        status_code=stream.status_code,
+        media_type=stream.media_type or _SSE_MEDIA_TYPE,
+    )
 
 
 def create_proxy_app(
@@ -195,10 +303,7 @@ def create_proxy_app(
         forwarded = _translate(raw, allowlist)
 
         if forwarded.get("stream"):
-            return StreamingResponse(
-                upstream.stream_chat_completions(forwarded),
-                media_type=_SSE_MEDIA_TYPE,
-            )
+            return await _stream_or_error(upstream, forwarded)
 
         result = await upstream.chat_completions(forwarded)
         return Response(

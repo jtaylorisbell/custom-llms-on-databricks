@@ -7,7 +7,8 @@ This is the process the logged ``metadata['entrypoint']`` command starts (see
    loaded), then
 2. polls the vLLM ``/health`` endpoint until it is ready, then
 3. serves the thin proxy (:func:`create_proxy_app`) on the public port 8080 via
-   uvicorn, and
+   uvicorn, while a background monitor watches the vLLM subprocess and shuts the
+   proxy down (with a non-zero exit) if vLLM dies, and
 4. tears the vLLM subprocess down cleanly on exit.
 
 The proxy is logged as flat MLflow code paths (``proxy.py`` + ``proxy_entrypoint.py``),
@@ -19,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shlex
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 
@@ -37,6 +40,7 @@ except ImportError:  # pragma: no cover - flat code-path import at serving runti
 __all__ = [
     "build_vllm_command",
     "main",
+    "monitor_vllm",
     "parse_adapter_names",
     "parse_args",
     "wait_for_vllm_ready",
@@ -167,8 +171,45 @@ def _terminate(process: subprocess.Popen[bytes], *, timeout_s: float = 10.0) -> 
         process.wait()
 
 
+def monitor_vllm(
+    process: subprocess.Popen[bytes],
+    server: uvicorn.Server,
+    *,
+    poll_interval_s: float = 2.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int | None:
+    """Watch the vLLM subprocess; when it exits, ask the proxy server to stop.
+
+    Run in a background thread alongside ``uvicorn.Server.run()``. If vLLM exits
+    after readiness, forwarding is permanently broken, so we set
+    ``server.should_exit`` to bring the proxy down and return the vLLM exit code —
+    the caller then terminates the proxy with a non-zero status so the serving
+    platform restarts the container.
+
+    Returns:
+        The vLLM exit code once it exits, or ``None`` if the loop ended because the
+        server was already shutting down for another reason (e.g. a signal).
+    """
+    while not server.should_exit:
+        exit_code = process.poll()
+        if exit_code is not None:
+            logger.error(
+                "vLLM subprocess exited with code %s after readiness; "
+                "shutting down proxy so the platform restarts it",
+                exit_code,
+            )
+            server.should_exit = True
+            return exit_code
+        sleep(poll_interval_s)
+    return None
+
+
 def main(argv: list[str] | None = None) -> None:
-    """Spawn vLLM, wait for readiness, then serve the proxy on the public port."""
+    """Spawn vLLM, wait for readiness, then serve the proxy on the public port.
+
+    A background monitor watches the vLLM subprocess for the lifetime of the proxy;
+    if vLLM dies the proxy is shut down and the process exits non-zero.
+    """
     logging.basicConfig(level=logging.INFO)
     args = parse_args(argv)
 
@@ -185,15 +226,31 @@ def main(argv: list[str] | None = None) -> None:
     )
     vllm_base_url = f"http://{args.vllm_host}:{args.vllm_port}"
 
-    logger.info("Starting vLLM OpenAI server: %s", " ".join(vllm_command))
+    # shlex.join for the log only; Popen still receives the argv list (shell-safe).
+    logger.info("Starting vLLM OpenAI server: %s", shlex.join(vllm_command))
     process = subprocess.Popen(vllm_command)
+    crashed: list[int | None] = []
     try:
         wait_for_vllm_ready(vllm_base_url, process=process)
         logger.info("vLLM ready; serving proxy on %s:%s", args.host, args.port)
         app = create_proxy_app(adapter_names, vllm_base_url)
-        uvicorn.run(app, host=args.host, port=args.port)
+        server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port))
+
+        def _watch() -> None:
+            crashed.append(monitor_vllm(process, server))
+
+        monitor = threading.Thread(target=_watch, name="vllm-monitor", daemon=True)
+        monitor.start()
+        server.run()  # blocks until should_exit (monitor on crash, or a signal)
+        monitor.join(timeout=5.0)
     finally:
         _terminate(process)
+
+    # If the monitor observed vLLM exiting on its own, fail so the serving platform
+    # restarts the container (force non-zero even if vLLM happened to exit 0).
+    crash_code = crashed[0] if crashed else None
+    if crash_code is not None:
+        raise SystemExit(crash_code or 1)
 
 
 if __name__ == "__main__":  # pragma: no cover

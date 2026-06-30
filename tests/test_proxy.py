@@ -10,16 +10,54 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from multi_adapter_serving.serving.proxy import UpstreamResponse, create_proxy_app
+
+
+class FakeStream:
+    """In-memory :class:`UpstreamStream` handle with a controllable response head."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        media_type: str | None,
+        chunks: list[bytes],
+        error_body: bytes,
+    ) -> None:
+        self._status_code = status_code
+        self._media_type = media_type
+        self._chunks = chunks
+        self._error_body = error_body
+        self.closed = False
+
+    @property
+    def status_code(self) -> int:
+        return self._status_code
+
+    @property
+    def media_type(self) -> str | None:
+        return self._media_type
+
+    async def aread(self) -> bytes:
+        return self._error_body
+
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class FakeUpstream:
     """In-memory stand-in for the vLLM OpenAI server.
 
     Records the bodies the proxy forwards so tests can assert the translation, and
-    lets each test control health, the unary response, and the streamed chunks.
+    lets each test control health, the unary response, and the streamed response
+    head/body.
     """
 
     def __init__(
@@ -28,20 +66,27 @@ class FakeUpstream:
         healthy: bool = True,
         response_body: dict[str, Any] | None = None,
         status_code: int = 200,
+        stream_status: int = 200,
+        stream_media_type: str | None = "text/event-stream",
         stream_chunks: list[bytes] | None = None,
+        stream_error_body: bytes = b"",
     ) -> None:
         self.healthy = healthy
         self.response_body = (
             response_body if response_body is not None else {"id": "cmpl-1"}
         )
         self.status_code = status_code
+        self.stream_status = stream_status
+        self.stream_media_type = stream_media_type
         self.stream_chunks = (
             stream_chunks
             if stream_chunks is not None
             else [b'data: {"x": 1}\n\n', b"data: [DONE]\n\n"]
         )
+        self.stream_error_body = stream_error_body
         self.chat_calls: list[dict[str, Any]] = []
         self.stream_calls: list[dict[str, Any]] = []
+        self.opened_streams: list[FakeStream] = []
 
     async def health(self) -> bool:
         return self.healthy
@@ -54,10 +99,16 @@ class FakeUpstream:
             media_type="application/json",
         )
 
-    async def stream_chat_completions(self, body: dict[str, Any]) -> AsyncIterator[bytes]:
+    async def open_chat_stream(self, body: dict[str, Any]) -> FakeStream:
         self.stream_calls.append(body)
-        for chunk in self.stream_chunks:
-            yield chunk
+        handle = FakeStream(
+            status_code=self.stream_status,
+            media_type=self.stream_media_type,
+            chunks=self.stream_chunks,
+            error_body=self.stream_error_body,
+        )
+        self.opened_streams.append(handle)
+        return handle
 
 
 def make_client(fake: FakeUpstream, adapters: list[str] | None = None) -> TestClient:
@@ -190,3 +241,79 @@ def test_streaming_passthrough() -> None:
     assert len(fake.stream_calls) == 1
     assert fake.stream_calls[0]["model"] == "ner"
     assert "custom_inputs" not in fake.stream_calls[0]
+    # The upstream stream handle is closed once the body is drained.
+    assert fake.opened_streams[0].closed is True
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    [["ner"], {"name": "ner"}, 123, "", None],
+    ids=["list", "dict", "number", "empty-string", "null"],
+)
+def test_malformed_adapter_returns_400_not_500(adapter: Any) -> None:
+    # A non-string/empty/missing adapter must be a client error (400). Before the
+    # fix, list/dict adapters raised TypeError at the allowlist check -> HTTP 500.
+    fake = FakeUpstream()
+    client = make_client(fake)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "custom_inputs": {"adapter": adapter},
+        },
+    )
+
+    assert resp.status_code == 400
+    assert fake.chat_calls == []
+    assert fake.stream_calls == []
+
+
+def test_streaming_upstream_4xx_returned_verbatim_not_sse() -> None:
+    # A vLLM pre-stream 4xx must surface as that status + body, not a 200 SSE.
+    fake = FakeUpstream(
+        stream_status=400,
+        stream_media_type="application/json",
+        stream_error_body=b'{"error": "bad request"}',
+    )
+    client = make_client(fake)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "custom_inputs": {"adapter": "ner"},
+            "stream": True,
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.content == b'{"error": "bad request"}'
+    assert resp.headers["content-type"].startswith("application/json")
+    assert not resp.headers["content-type"].startswith("text/event-stream")
+    assert fake.opened_streams[0].closed is True
+
+
+def test_streaming_upstream_5xx_returned_verbatim_not_sse() -> None:
+    # A vLLM pre-stream 5xx must surface as that status + body, not a 200 SSE.
+    fake = FakeUpstream(
+        stream_status=503,
+        stream_media_type="application/json",
+        stream_error_body=b'{"error": "engine overloaded"}',
+    )
+    client = make_client(fake)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "custom_inputs": {"adapter": "code"},
+            "stream": True,
+        },
+    )
+
+    assert resp.status_code == 503
+    assert resp.content == b'{"error": "engine overloaded"}'
+    assert resp.headers["content-type"].startswith("application/json")
+    assert not resp.headers["content-type"].startswith("text/event-stream")
+    assert fake.opened_streams[0].closed is True
