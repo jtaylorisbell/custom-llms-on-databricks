@@ -16,6 +16,12 @@ Nothing here is hardcoded to a specific model — everything is driven by config
 src/multi_adapter_serving/
   config.py      # pydantic schema + load_config()
   staging.py     # stage_weights() — HF/local -> Unity Catalog Volume
+  model.py       # log_and_register() — MLflow ChatModel -> Unity Catalog
+  serving/       # entrypoint command + multi-LoRA proxy in front of vLLM
+  deploy.py      # deploy_endpoint() — create/update the Serverless GPU endpoint
+  client.py      # query() — {adapter, prompt} -> assistant text
+  smoke_test.py  # smoke_test() — exercise every adapter on the endpoint
+  cli.py         # multi-adapter-serve — end-to-end stage->register->deploy->smoke
 config.example.yaml   # annotated example of the shared config contract
 tests/                # unit tests (no network / Databricks access required)
 ```
@@ -82,6 +88,96 @@ The manifest maps each logical weight name to its final UC Volume path:
 All network and Unity Catalog operations are injectable
 (`downloader`, `uploader`, `local_path_exists`, `uc_path_exists`) so the planner
 can be unit tested without any network or Databricks access.
+
+## Deploying the endpoint
+
+The model is logged with `env_pack="databricks_model_serving"` for
+[express deployment of a custom LLM](https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms),
+so `deploy_endpoint` just points a **Serverless GPU** serving endpoint at the
+Unity Catalog registered model + version:
+
+```python
+from multi_adapter_serving import load_config
+from multi_adapter_serving.deploy import deploy_endpoint
+
+config = load_config("config.yaml")
+result = deploy_endpoint(config, "catalog.schema.model_name", version)
+print(result.endpoint_name, result.action, result.ready)
+```
+
+It creates the endpoint named `config.serving.endpoint_name` if it does not
+exist (otherwise updates its config in place), then polls until `READY` or
+surfaces a useful error. The served entity is built from config:
+
+| served-entity field    | source                       |
+| ---------------------- | ---------------------------- |
+| `entity_name`          | `model_full_name` (UC model) |
+| `entity_version`       | `model_version`              |
+| `workload_type`        | `serving.workload_type` (GPU)|
+| `workload_size`        | `serving.workload_size`      |
+| `scale_to_zero_enabled`| `serving.scale_to_zero`      |
+
+The serving client is injectable (`serving_client`) so deployment is fully unit
+testable with **no Databricks workspace, no GPU, and no real (paid) deploy**.
+
+## Querying an adapter
+
+`query` is the user-facing two-argument interface — pick an adapter by name and
+send a prompt:
+
+```python
+from multi_adapter_serving.client import query
+
+result = query("multi-lora-vllm", adapter="ner", prompt="Tag the entities: ...")
+print(result.text)   # assistant reply
+print(result.raw)    # full response
+```
+
+The adapter travels in `custom_inputs.adapter` (the proxy contract). The exact
+`llm/v1/chat` wire payload is:
+
+```json
+{
+  "messages": [{"role": "user", "content": "<prompt>"}],
+  "custom_inputs": {"adapter": "<adapter>"}
+}
+```
+
+plus any pass-through chat kwargs (`temperature`, `max_tokens`, `stream`, ...).
+The endpoint is invoked over **OAuth** via the Databricks SDK (config profile) —
+never a personal access token.
+
+## Smoke-testing every adapter
+
+```python
+from multi_adapter_serving.smoke_test import smoke_test
+
+results = smoke_test(config)  # {adapter: {"ok": bool, "snippet"/"error": str}}
+```
+
+`smoke_test` queries every adapter once, never aborting on a single failure, so
+the report shows pass/fail for all adapters at once.
+
+## End-to-end CLI
+
+The `multi-adapter-serve` console script runs the full workflow — stage →
+register → deploy → smoke — from a single config:
+
+```bash
+multi-adapter-serve --config config.yaml                      # all steps, in order
+multi-adapter-serve --config config.yaml --steps stage,register
+multi-adapter-serve --config config.yaml --steps smoke         # query an existing endpoint
+multi-adapter-serve --config config.yaml --dry-run             # plan only, no real calls
+```
+
+| flag        | meaning                                                            |
+| ----------- | ------------------------------------------------------------------ |
+| `--config`  | path to the config YAML (default: `config.yaml`)                   |
+| `--steps`   | comma subset of `stage,register,deploy,smoke` (always run in order)|
+| `--dry-run` | print the plan and make **no** real Databricks/network calls       |
+
+It prints a clear summary: the staged manifest, the registered model + version,
+the endpoint name + state, and per-adapter smoke results.
 
 ## Quality gates
 
