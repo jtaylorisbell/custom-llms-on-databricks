@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# uv / tool caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Local config (the example is committed; real config.yaml is not)
+config.yaml
+
+# Local weight cache
+multi_adapter_serving_cache/
+
+# Env / secrets
+.env
