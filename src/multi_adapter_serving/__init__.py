@@ -9,6 +9,7 @@ from multi_adapter_serving.config import (
     SourceType,
     UnityCatalogConfig,
     VLLMConfig,
+    VLLMDtype,
     load_config,
 )
 from multi_adapter_serving.staging import (
@@ -30,6 +31,7 @@ __all__ = [
     "UCUploader",
     "UnityCatalogConfig",
     "VLLMConfig",
+    "VLLMDtype",
     "load_config",
     "stage_weights",
 ]

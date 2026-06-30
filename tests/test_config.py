@@ -162,3 +162,34 @@ def test_adapter_name_and_ref_are_stripped(tmp_path: Path) -> None:
     config = load_config(write_yaml(tmp_path, data))
     assert config.adapters[0].name == "adapter_a"
     assert config.adapters[0].ref == "org/adapter-a"
+
+
+def test_vllm_dtype_defaults_to_half(tmp_path: Path) -> None:
+    data = valid_config_dict()
+    assert "dtype" not in data["vllm"]
+    config = load_config(write_yaml(tmp_path, data))
+    assert config.vllm.dtype == "half"
+
+
+def test_vllm_dtype_explicit_valid(tmp_path: Path) -> None:
+    data = valid_config_dict()
+    data["vllm"]["dtype"] = "bfloat16"
+    config = load_config(write_yaml(tmp_path, data))
+    assert config.vllm.dtype == "bfloat16"
+
+
+def test_vllm_dtype_invalid_raises(tmp_path: Path) -> None:
+    data = valid_config_dict()
+    data["vllm"]["dtype"] = "int8"
+    with pytest.raises(ValidationError):
+        load_config(write_yaml(tmp_path, data))
+
+
+def test_shipped_example_config_loads() -> None:
+    example = Path(__file__).resolve().parents[1] / "config.example.yaml"
+    config = load_config(example)
+    assert isinstance(config, Config)
+    assert config.source_type == "huggingface"
+    assert config.base_model.ref == "mistralai/Mistral-7B-Instruct-v0.2"
+    assert [a.name for a in config.adapters] == ["ner", "code"]
+    assert config.vllm.dtype == "half"

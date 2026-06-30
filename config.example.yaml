@@ -5,6 +5,9 @@
 # This is the SHARED CONTRACT consumed by `multi_adapter_serving.config.load_config`
 # and by every other track. The field names below are the exact contract — do not
 # rename them.
+#
+# This file ships as a working, verified example: `load_config("config.example.yaml")`
+# must parse and validate successfully (there is a test that asserts this).
 # ---------------------------------------------------------------------------
 
 # Where the weights come from. One of: huggingface | local
@@ -14,15 +17,18 @@ source_type: huggingface
 
 base_model:
   # The base model that all adapters attach to.
-  ref: PLACEHOLDER_BASE_MODEL_REF  # TODO: filled in by example-selection (HF repo id or UC Volume path)
+  ref: mistralai/Mistral-7B-Instruct-v0.2
 
 adapters:
   # One entry per LoRA adapter. `name` is the logical id used in the {adapter}
   # request field; it must be unique and non-empty. There must be at least one.
-  - name: adapter_a
-    ref: PLACEHOLDER_ADAPTER_A_REF  # TODO: filled in by example-selection (HF repo id or path)
-  - name: adapter_b
-    ref: PLACEHOLDER_ADAPTER_B_REF  # TODO: filled in by example-selection (HF repo id or path)
+  #
+  # These are 'Medusa-LoRA' repos: vLLM loads the PEFT LoRA from
+  # adapter_model.safetensors and ignores the extra medusa_lm_head.safetensors.
+  - name: ner
+    ref: predibase/Mistral-7B-Instruct-v0.2-conllpp-medusa-lora
+  - name: code
+    ref: predibase/Mistral-7B-Instruct-v0.2-magicoder-medusa-lora
 
 unity_catalog:
   # Destination for staged weights and the registered model. Weights are staged
@@ -41,9 +47,11 @@ serving:
 
 vllm:
   # vLLM engine settings. max_loras and max_lora_rank must be > 0.
-  max_loras: 4
+  max_loras: 2
   max_lora_rank: 16
   max_model_len: 8192
+  # Model dtype: one of auto | half | bfloat16 | float16 | float32 (default: half).
+  dtype: half
 
 databricks:
   # OAuth config profile used for all Databricks API calls (never a PAT).

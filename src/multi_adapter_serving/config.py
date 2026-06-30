@@ -26,12 +26,17 @@ __all__ = [
     "SourceType",
     "UnityCatalogConfig",
     "VLLMConfig",
+    "VLLMDtype",
     "load_config",
 ]
 
 # Allowed values for ``source_type``. Kept as a module-level alias so other tracks
 # can import the literal type rather than re-declaring it.
 SourceType = Literal["huggingface", "local"]
+
+# Allowed values for the vLLM ``dtype`` setting. Module-level alias for the same
+# reason as ``SourceType``.
+VLLMDtype = Literal["auto", "half", "bfloat16", "float16", "float32"]
 
 
 class BaseModelSpec(BaseModel):
@@ -109,6 +114,10 @@ class VLLMConfig(BaseModel):
     max_loras: int = Field(..., gt=0)
     max_lora_rank: int = Field(..., gt=0)
     max_model_len: int = Field(..., gt=0)
+    dtype: VLLMDtype = Field(
+        default="half",
+        description="vLLM model dtype; one of auto/half/bfloat16/float16/float32.",
+    )
 
 
 class DatabricksConfig(BaseModel):
