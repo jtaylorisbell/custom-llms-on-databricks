@@ -88,6 +88,16 @@ class FakeMlflow:
     def __init__(self) -> None:
         self.pyfunc = FakePyfunc()
         self.register_calls: list[dict[str, Any]] = []
+        # Record the URIs log_and_register points MLflow at (default: Databricks + UC).
+        # Offline: no network — these just capture what would be configured live.
+        self.tracking_uri: str | None = None
+        self.registry_uri: str | None = None
+
+    def set_tracking_uri(self, uri: str) -> None:
+        self.tracking_uri = uri
+
+    def set_registry_uri(self, uri: str) -> None:
+        self.registry_uri = uri
 
     def register_model(
         self, model_uri: str, name: str, **kwargs: Any
@@ -185,6 +195,11 @@ def test_log_and_register_logs_to_local_file_store(tmp_path: Path) -> None:
     call is stubbed, so the test stays fully offline while proving the model logs.
     Before the fix this raised ``NotImplementedError`` at log time; after the fix it
     logs successfully with the chat serving contract intact.
+
+    ``uri_configurator`` is overridden to a no-op so ``log_and_register`` does NOT point
+    MLflow at Databricks + Unity Catalog: this test has already set a tmp file store as
+    the tracking+registry URI below, and that local store must stay in effect to keep the
+    real log path offline.
     """
     mlflow.set_tracking_uri(f"file:{tmp_path / 'mlruns'}")
 
@@ -206,7 +221,12 @@ def test_log_and_register_logs_to_local_file_store(tmp_path: Path) -> None:
         # Simulate the local-CLI case (no Databricks runtime): env_pack must be omitted
         # so this real register path would succeed offline.
         name, version = log_and_register(
-            config, manifest, mlflow_module=local_mlflow, runtime_detector=lambda: False
+            config,
+            manifest,
+            mlflow_module=local_mlflow,
+            runtime_detector=lambda: False,
+            # Keep offline: do NOT switch to Databricks/UC; the tmp file store set above stays.
+            uri_configurator=lambda _m, _profile: None,
         )
 
     # --- register stayed offline (guarded) and returned our fake version ---
@@ -263,3 +283,29 @@ def test_env_pack_applied_on_databricks_serverless_runtime() -> None:
     assert reg["kwargs"]["env_pack"] == ENV_PACK == "databricks_model_serving"
     assert name == "classic_stable_h0vpq7_catalog.default.multi_lora_vllm"
     assert version == 7
+
+
+def test_register_path_targets_unity_catalog_registry() -> None:
+    """Regression: register must target the Unity Catalog registry, not a local one.
+
+    The live failure logged/registered into a LOCAL sqlite tracking+registry store (no
+    ``set_registry_uri`` / ``databricks-uc`` anywhere), so the three-level UC name became a
+    plain local model name and ``deploy`` failed with ``ResourceDoesNotExist: Registered
+    model ... does not exist`` — the version never landed in Unity Catalog. The fix points
+    MLflow's tracking + registry at Databricks + UC, scoped to ``config.databricks.profile``,
+    BEFORE logging/registering.
+
+    Fully offline: the injected fake records the URIs and stubs ``register_model``; no
+    Databricks and no network. This uses the DEFAULT ``uri_configurator`` — the exact live
+    code path — asserting it targets ``databricks-uc://<profile>`` and not a local registry.
+    """
+    fake = FakeMlflow()
+    config = make_config()  # databricks.profile == "fevm-aws"
+
+    log_and_register(config, make_manifest(), mlflow_module=fake)
+
+    # Registry -> Unity Catalog (not a local sqlite/file registry); tracking -> the
+    # Databricks workspace; both scoped to the config's OAuth profile.
+    assert fake.registry_uri == "databricks-uc://fevm-aws"
+    assert fake.registry_uri.startswith("databricks-uc")
+    assert fake.tracking_uri == "databricks://fevm-aws"

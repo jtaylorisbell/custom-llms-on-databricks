@@ -28,8 +28,16 @@ metadata explicitly. That yields a byte-for-byte-equivalent serving contract (ch
 signature + task + entrypoint + env_pack) with no ``predict()`` invocation at log
 time. See :data:`CHAT_SIGNATURE`.
 
-All MLflow/registry calls are injectable (``mlflow_module``) so authoring can be unit
-tested with no Databricks or MLflow tracking server.
+Before logging/registering we point MLflow at the Databricks workspace + Unity Catalog
+model registry, scoped to the config's ``databricks.profile`` (OAuth) — the same profile
+the deploy step's ``WorkspaceClient`` uses. Without this MLflow silently defaults to a
+*local* sqlite tracking+registry store and treats the three-level ``catalog.schema.model``
+name as a plain local model name, so the version is created off in a local registry and
+``deploy`` cannot find the Unity Catalog model. See :func:`_configure_uc_registry`.
+
+All MLflow/registry calls are injectable (``mlflow_module``, ``uri_configurator``,
+``runtime_detector``) so authoring can be unit tested with no Databricks and no network —
+tests override the URI configuration to a tmp/local file store and never hit Databricks.
 """
 
 from __future__ import annotations
@@ -111,6 +119,31 @@ def _default_mlflow() -> Any:
     return mlflow
 
 
+def _databricks_uc_uris(profile: str) -> tuple[str, str]:
+    """MLflow ``(tracking_uri, registry_uri)`` for a Databricks workspace + Unity Catalog.
+
+    Both are scoped to the Databricks SDK config ``profile`` (OAuth), matching the
+    ``WorkspaceClient(profile=...)`` the deploy step uses. The ``databricks-uc://`` scheme
+    selects the **Unity Catalog** model registry (three-level ``catalog.schema.model``
+    names) rather than a workspace-local / sqlite registry.
+    """
+    return f"databricks://{profile}", f"databricks-uc://{profile}"
+
+
+def _configure_uc_registry(mlflow: Any, profile: str) -> None:
+    """Point MLflow's tracking + model registry at Databricks + Unity Catalog.
+
+    Must run before ``log_model`` / ``register_model`` so the experiment run logs to the
+    Databricks workspace and the model version is created in the Unity Catalog registry.
+    Without it MLflow defaults to a local sqlite tracking+registry store and treats the
+    three-level UC name as a plain local model name, so ``deploy`` cannot find the version
+    at ``{catalog}.{schema}.{model_name}`` (the exact live failure this fixes).
+    """
+    tracking_uri, registry_uri = _databricks_uc_uris(profile)
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_registry_uri(registry_uri)
+
+
 def _in_databricks_serverless_runtime() -> bool:
     """Whether ``env_pack='databricks_model_serving'`` can pack the serving env here.
 
@@ -136,8 +169,14 @@ def log_and_register(
     chat_model: Any = None,
     artifact_name: str = DEFAULT_ARTIFACT_NAME,
     runtime_detector: Callable[[], bool] | None = None,
+    uri_configurator: Callable[[Any, str], None] | None = None,
 ) -> tuple[str, int]:
     """Log the pyfunc model and register it to Unity Catalog.
+
+    Before logging, points MLflow's tracking + model registry at the Databricks workspace
+    and Unity Catalog, scoped to ``config.databricks.profile`` (see
+    :func:`_configure_uc_registry`), so the run logs to the workspace and the model version
+    is created in Unity Catalog rather than a local sqlite registry.
 
     Logs the model with the explicit ``llm/v1/chat`` signature (:data:`CHAT_SIGNATURE`)
     and ``metadata={'task': 'llm/v1/chat', 'entrypoint': <cmd>}`` plus the proxy
@@ -168,6 +207,11 @@ def log_and_register(
         runtime_detector: Injectable predicate deciding whether ``env_pack`` is applied
             (defaults to :func:`_in_databricks_serverless_runtime`). Overridable in
             tests to exercise both the on-runtime and off-runtime register paths.
+        uri_configurator: Injectable callback ``(mlflow_module, profile) -> None`` that
+            points MLflow's tracking + registry URIs before logging (defaults to
+            :func:`_configure_uc_registry`, which targets Databricks + Unity Catalog).
+            Overridable in tests to a tmp/local file store so authoring stays offline and
+            never hits Databricks.
 
     Returns:
         ``(registered_model_full_name, version)``.
@@ -177,6 +221,13 @@ def log_and_register(
     detect_runtime = (
         runtime_detector if runtime_detector is not None else _in_databricks_serverless_runtime
     )
+    configure_uris = uri_configurator if uri_configurator is not None else _configure_uc_registry
+
+    # Point tracking + registry at Databricks + Unity Catalog BEFORE logging/registering,
+    # scoped to the config's OAuth profile, so the run logs to the workspace and the model
+    # version is created in UC (not a local sqlite registry). Tests override this to a
+    # tmp/local store to stay offline.
+    configure_uris(mlflow, config.databricks.profile)
 
     entrypoint = build_entrypoint_command(config, manifest)
     metadata = {
