@@ -35,6 +35,7 @@ __all__ = [
     "PathChecker",
     "UCUploader",
     "stage_weights",
+    "staged_manifest",
 ]
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,35 @@ def _plan(config: Config) -> list[_StageItem]:
         for adapter in config.adapters
     )
     return items
+
+
+def staged_manifest(config: Config) -> dict[str, str]:
+    """Reconstruct the staging manifest deterministically from config — no I/O.
+
+    Returns the SAME mapping :func:`stage_weights` would produce, computed purely
+    from ``config`` with no downloads, uploads, or existence checks. Use it to resume
+    the pipeline (``register`` / ``deploy`` / ``smoke``) against weights already staged
+    in Unity Catalog, without re-running ``stage`` — avoiding a full re-upload.
+
+    Staged paths are deterministic (see :func:`_plan`): ``"base"`` maps to
+    ``{prefix}/base`` and each adapter ``<name>`` to ``{prefix}/adapters/<name>``,
+    where ``prefix`` is ``/Volumes/{catalog}/{schema}/{volume}/{model_name}``. The one
+    exception mirrors ``stage_weights`` exactly: a ``local`` ref that already points at
+    a ``/Volumes/...`` path is passed through unchanged (it is never re-homed under the
+    model prefix), so reconstruction equals the real staged manifest for every
+    ``source_type``.
+
+    This validates nothing — it assumes the weights are already present (the
+    resumability premise). Any genuinely-missing weights surface later, at register /
+    serving time (this function makes no Databricks calls by design).
+    """
+    manifest: dict[str, str] = {}
+    for item in _plan(config):
+        if config.source_type == "local" and _is_uc_volume_path(item.ref):
+            manifest[item.key] = item.ref
+        else:
+            manifest[item.key] = item.target
+    return manifest
 
 
 def stage_weights(

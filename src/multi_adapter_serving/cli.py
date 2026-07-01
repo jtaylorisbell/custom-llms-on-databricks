@@ -13,10 +13,19 @@ Implements the Databricks custom-LLM deployment steps as one command, in order:
 
 Run a subset with ``--steps`` and preview without side effects with ``--dry-run``.
 
+A subset that omits ``stage`` still works: because staged Unity Catalog paths are
+deterministic, ``register`` reconstructs the staging manifest from config
+(:func:`~multi_adapter_serving.staging.staged_manifest`) instead of re-uploading
+weights. This makes register/deploy/smoke cheap to re-run against weights already
+staged in UC. ``deploy`` still requires ``register`` in the same run (it needs the
+freshly registered UC model version).
+
 Usage::
 
     multi-adapter-serve --config config.yaml
     multi-adapter-serve --config config.yaml --steps stage,register
+    # resume off already-staged UC weights (no re-upload):
+    multi-adapter-serve --config config.yaml --steps register,deploy,smoke
     multi-adapter-serve --config config.yaml --steps smoke
     multi-adapter-serve --config config.yaml --dry-run
 """
@@ -42,7 +51,7 @@ from multi_adapter_serving.deploy import (
 )
 from multi_adapter_serving.model import log_and_register
 from multi_adapter_serving.smoke_test import smoke_test
-from multi_adapter_serving.staging import stage_weights
+from multi_adapter_serving.staging import stage_weights, staged_manifest
 
 __all__ = ["main"]
 
@@ -55,9 +64,18 @@ CANONICAL_STEPS: tuple[str, ...] = ("stage", "register", "deploy", "smoke")
 _STEP_ALIASES = {"smoke-test": "smoke", "smoketest": "smoke"}
 
 # Each step's required predecessor that must also be selected, so its output is
-# produced within the same run. Steps not listed have no in-run prerequisite
-# (``stage`` needs nothing; ``smoke`` can query a pre-existing endpoint).
-_STEP_REQUIRES = {"register": "stage", "deploy": "register"}
+# produced within the same run. Steps not listed have no in-run prerequisite:
+#
+# * ``stage`` needs nothing.
+# * ``register`` does NOT require ``stage``. Staged UC paths are deterministic, so
+#   when ``stage`` is not selected the manifest is reconstructed from config
+#   (:func:`staged_manifest`) and register runs against weights already in Unity
+#   Catalog — no multi-GB re-upload just to iterate on register/deploy/smoke.
+# * ``deploy`` still requires ``register`` in the same run: it needs the freshly
+#   registered UC model + version, which are assigned by the registry and cannot be
+#   derived from config (and we make no live calls to look them up here).
+# * ``smoke`` can query a pre-existing endpoint.
+_STEP_REQUIRES = {"deploy": "register"}
 
 # Process exit codes. Distinct codes let callers tell the failure modes apart.
 EXIT_OK = 0
@@ -227,7 +245,16 @@ def _run_stage(config: Config, state: _PipelineState) -> None:
 
 def _run_register(config: Config, state: _PipelineState) -> None:
     if state.manifest is None:
-        raise CliError("step 'register' requires a manifest; include 'stage' in --steps")
+        # 'stage' did not run in this invocation. Rather than force a full weight
+        # re-upload, reconstruct the manifest deterministically from config and
+        # register against the weights already staged in Unity Catalog. A same-run
+        # 'stage' always sets state.manifest first, which we prefer (it reflects any
+        # local UC pass-through refs authoritatively); we only fall back here.
+        state.manifest = staged_manifest(config)
+        print(
+            "==> register: 'stage' not in this run; reconstructing the staged manifest "
+            "from config (weights assumed already in Unity Catalog) ..."
+        )
     print("==> register: logging + registering the model to Unity Catalog ...")
     name, version = log_and_register(config, state.manifest)
     state.model_full_name = name
@@ -270,9 +297,15 @@ def _print_dry_run_plan(config: Config, steps: list[str]) -> None:
             print(f"  [stage]    would stage base + {len(config.adapters)} adapter(s) "
                   f"({config.source_type}) under {volume_prefix}/")
         elif step == "register":
+            manifest_note = (
+                "manifest from stage"
+                if "stage" in steps
+                else "manifest reconstructed from config (weights assumed staged in UC)"
+            )
             print(f"  [register] would log the pyfunc chat model and register it as "
-                  f"{model_full_name} (env_pack=databricks_model_serving only on a "
-                  f"Databricks serverless runtime; omitted when run locally)")
+                  f"{model_full_name} ({manifest_note}; "
+                  f"env_pack=databricks_model_serving only on a Databricks serverless "
+                  f"runtime, omitted when run locally)")
         elif step == "deploy":
             print(f"  [deploy]   would create/update endpoint {serving.endpoint_name!r} "
                   f"({serving.workload_type}/{serving.workload_size}, "

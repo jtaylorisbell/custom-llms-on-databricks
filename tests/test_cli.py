@@ -158,6 +158,83 @@ def test_smoke_only_needs_no_prerequisite(monkeypatch: pytest.MonkeyPatch) -> No
     assert rec.order == ["smoke"]
 
 
+# --- resumability: register/deploy/smoke run without re-staging -------------------
+
+
+# The manifest register receives when 'stage' is NOT in the run: reconstructed from
+# config (deterministic UC paths), distinct from Recorder._stage's fake manifest.
+_RECONSTRUCTED_MANIFEST = {
+    "base": "/Volumes/classic_stable_h0vpq7_catalog/default/weights/multi_lora_vllm/base",
+    "ner": "/Volumes/classic_stable_h0vpq7_catalog/default/weights/multi_lora_vllm/adapters/ner",
+    "code": "/Volumes/classic_stable_h0vpq7_catalog/default/weights/multi_lora_vllm/adapters/code",
+}
+
+
+def test_register_without_stage_reconstructs_manifest_from_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = Recorder(monkeypatch)
+
+    # 'register' alone no longer forces 'stage' — the 14GB re-upload is skipped.
+    rc = cli.main(["--config", "config.yaml", "--steps", "register"])
+
+    assert rc == cli.EXIT_OK
+    assert rec.order == ["register"]
+    assert "stage" not in rec.order
+    # register ran against the deterministically reconstructed UC manifest.
+    assert rec.calls["register"]["manifest"] == _RECONSTRUCTED_MANIFEST
+
+
+def test_register_deploy_smoke_suffix_runs_without_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = Recorder(monkeypatch)
+
+    rc = cli.main(["--config", "config.yaml", "--steps", "register,deploy,smoke"])
+
+    assert rc == cli.EXIT_OK
+    # The whole tail runs off already-staged weights; stage is never invoked.
+    assert rec.order == ["register", "deploy", "smoke"]
+    assert "stage" not in rec.order
+    assert rec.calls["register"]["manifest"] == _RECONSTRUCTED_MANIFEST
+    # register's output still threads into deploy.
+    assert rec.calls["deploy"]["name"] == "classic_stable_h0vpq7_catalog.default.multi_lora_vllm"
+    assert rec.calls["deploy"]["version"] == 7
+
+
+def test_full_run_prefers_real_staged_manifest_over_reconstruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rec = Recorder(monkeypatch)
+
+    rc = cli.main(["--config", "config.yaml", "--steps", "stage,register"])
+
+    assert rc == cli.EXIT_OK
+    assert rec.order == ["stage", "register"]
+    # When stage runs, register uses stage's actual manifest, NOT the reconstruction.
+    assert rec.calls["register"]["manifest"] == {
+        "base": "/Volumes/x/base",
+        "ner": "/Volumes/x/ner",
+        "code": "/Volumes/x/code",
+    }
+    assert rec.calls["register"]["manifest"] != _RECONSTRUCTED_MANIFEST
+
+
+def test_deploy_still_requires_register_in_same_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rec = Recorder(monkeypatch)
+
+    # Relaxing register's stage requirement does NOT relax deploy's need for a
+    # freshly registered version: --steps deploy (or deploy,smoke) is still rejected.
+    rc = cli.main(["--config", "config.yaml", "--steps", "deploy,smoke"])
+
+    assert rc == cli.EXIT_USAGE
+    assert rec.order == []
+    err = capsys.readouterr().err
+    assert "requires" in err and "register" in err
+
+
 def test_dry_run_makes_no_real_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     rec = Recorder(monkeypatch)
 

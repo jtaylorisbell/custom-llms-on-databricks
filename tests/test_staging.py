@@ -18,6 +18,7 @@ from multi_adapter_serving.staging import (
     _make_uc_uploader,
     _parent_dir,
     stage_weights,
+    staged_manifest,
 )
 
 UC_PREFIX = "/Volumes/classic_stable_h0vpq7_catalog/default/weights/multi_lora_vllm"
@@ -349,3 +350,65 @@ def test_default_existence_checker_false_when_missing() -> None:
     checker = _make_uc_existence_checker("fevm-aws", files_client=fake)
 
     assert checker("/Volumes/c/s/v/m/missing") is False
+
+
+# --- staged_manifest: deterministic reconstruction (resumability) -----------------
+
+
+def test_staged_manifest_reconstructs_deterministic_paths() -> None:
+    # Pure reconstruction from config: the deterministic UC paths, no I/O.
+    manifest = staged_manifest(make_config())
+
+    assert manifest == {
+        "base": f"{UC_PREFIX}/base",
+        "adapter_a": f"{UC_PREFIX}/adapters/adapter_a",
+        "adapter_b": f"{UC_PREFIX}/adapters/adapter_b",
+    }
+
+
+def test_staged_manifest_matches_stage_weights_for_huggingface() -> None:
+    # Reconstruction must equal the manifest a real huggingface stage would produce,
+    # so resuming register/deploy/smoke targets exactly the staged weights.
+    config = make_config()
+    real = stage_weights(config, downloader=FakeDownloader(), uploader=FakeUploader())
+
+    assert staged_manifest(config) == real
+
+
+def test_staged_manifest_matches_stage_weights_for_local_uc_passthrough() -> None:
+    # For source_type=local, an already-in-UC ref is passed through unchanged, while a
+    # local filesystem ref maps to the deterministic target. Reconstruction mirrors
+    # both, so it equals the real staged manifest here too (no re-homing of UC refs).
+    existing_uc = "/Volumes/other/place/vol/already_here"
+    config = make_config(
+        source_type="local",
+        base_model={"ref": "/data/base"},
+        adapters=[
+            {"name": "adapter_a", "ref": "/data/adapter_a"},
+            {"name": "adapter_b", "ref": existing_uc},
+        ],
+    )
+    real = stage_weights(
+        config,
+        uploader=FakeUploader(),
+        local_path_exists=lambda _p: True,
+        uc_path_exists=lambda _p: True,
+    )
+
+    reconstructed = staged_manifest(config)
+    assert reconstructed == real
+    assert reconstructed == {
+        "base": f"{UC_PREFIX}/base",
+        "adapter_a": f"{UC_PREFIX}/adapters/adapter_a",
+        "adapter_b": existing_uc,
+    }
+
+
+def test_staged_manifest_does_no_io() -> None:
+    # It takes no downloader/uploader/existence-checker and touches nothing: a
+    # missing local ref does NOT raise (unlike stage_weights), proving no validation.
+    config = make_config(source_type="local", base_model={"ref": "/definitely/missing"})
+
+    manifest = staged_manifest(config)
+
+    assert manifest["base"] == f"{UC_PREFIX}/base"
