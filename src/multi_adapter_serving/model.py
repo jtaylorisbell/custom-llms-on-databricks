@@ -14,8 +14,9 @@ CLI's design case, a local laptop — it raises ``Failed to parse databricks run
 version 'None'`` (see :data:`ENV_PACK` and :func:`_in_databricks_serverless_runtime`),
 so we omit it. ``env_pack`` is an express (fast cold-start) optimization, not a
 serving requirement: without it Model Serving builds the environment at deploy time
-from the requirements logged alongside the model (``pyproject.toml`` / ``uv.lock`` /
-``.python-version``), and the serving contract (task, entrypoint, chat signature,
+from the curated requirements logged alongside the model (:data:`SERVING_PIP_REQUIREMENTS`,
+passed explicitly to ``log_model`` — see below for why we do NOT let MLflow infer them from
+the dev ``uv.lock``), and the serving contract (task, entrypoint, chat signature,
 code paths) is unchanged.
 
 Why a plain ``PythonModel`` instead of MLflow's ``ChatModel`` base class: logging a
@@ -78,6 +79,7 @@ __all__ = [
     "CHAT_SIGNATURE",
     "CHAT_TASK",
     "ENV_PACK",
+    "SERVING_PIP_REQUIREMENTS",
     "ModelVersionResolutionError",
     "MultiLoRAChatModel",
     "latest_ready_model_version",
@@ -103,6 +105,58 @@ ENV_PACK = "databricks_model_serving"
 
 # Default run-relative artifact name for the logged model.
 DEFAULT_ARTIFACT_NAME = "model"
+
+# Curated, PUBLIC-installable serving requirements passed explicitly to log_model
+# (``pip_requirements=``). This is the fix for the live register failure on the
+# serverless GPU node: when ``pip_requirements`` is None, MLflow 3.12 *infers* the
+# environment (``mlflow.pyfunc.log_model`` -> ``infer_pip_requirements`` in
+# ``mlflow/pyfunc/model.py``), which for a uv project runs ``uv export`` and captures
+# our ENTIRE dev ``uv.lock`` (235 deps) as the model's serving requirements. That set
+# (a) is sourced from a PRIVATE index (``pypi-proxy.dev.databricks.com`` — every URL in
+# uv.lock), which has no credentials at serving load time, and (b) is then *unioned* with
+# pyfunc's ``get_default_pip_requirements()`` == ``cloudpickle==<installed>``; on the
+# serverless base image the installed cloudpickle is ``3.0.0`` while the dev lock pins
+# ``3.1.2``, so the merged set carries BOTH and MLflow's dependency lock fails with
+# ``ResolutionImpossible: Cannot install cloudpickle==3.0.0 and cloudpickle==3.1.2``.
+#
+# Passing an explicit ``pip_requirements`` list makes MLflow 3.12 SKIP inference entirely
+# (``mlflow/pyfunc/model.py``: ``if pip_requirements is None: ... else: default_reqs =
+# None``; ``infer_pip_requirements`` is never called) and use ONLY this list (deduped, with
+# an ``mlflow`` pin auto-inserted iff absent — ``mlflow-skinny`` satisfies that check via
+# ``_is_mlflow_requirement``). Result: no uv export, no private index, and a single
+# cloudpickle — the logged ``requirements.txt`` is exactly this curated set.
+#
+# This is orthogonal to ``env_pack``: ``pip_requirements`` is a ``log_model`` argument that
+# governs the requirements MLflow captures + validates at log time (what was failing);
+# ``env_pack`` (below) is a ``register_model`` argument that packs the installed serverless
+# env as the express serving image. Passing curated requirements does not fight env_pack —
+# it just makes the log-time requirement capture clean; on express deploys the packed env is
+# authoritative, and on non-express deploys Model Serving builds from this curated set.
+#
+# Versions mirror pyproject.toml's specifiers (all real PUBLIC PyPI releases). torch and
+# peft are intentionally omitted: neither is imported directly (LoRA is handled inside
+# vLLM), and torch is resolved transitively by vLLM's own exact pin — pinning it here would
+# risk fighting that resolution.
+SERVING_PIP_REQUIREMENTS = [
+    # MLflow model-format loader. mlflow-skinny (not the heavy mlflow[databricks] dev extra,
+    # which drags in databricks-agents + its own cloudpickle constraint) keeps serving lean;
+    # databricks-sdk is listed explicitly below for the Databricks auth the extra provided.
+    "mlflow-skinny==3.12.0",
+    "databricks-sdk>=0.102.0",
+    # vLLM engine + model/adapter loading (the real serving runtime behind the proxy).
+    "vllm==0.11.2",
+    "transformers==4.57.6",
+    "huggingface-hub>=0.34.0,<1.0",
+    # Multi-adapter proxy runtime (the logged entrypoint's own deps).
+    "fastapi>=0.138.0",
+    "uvicorn>=0.49.0",
+    "httpx>=0.28.1",
+    "pydantic>=2",
+    "pyyaml>=6.0.3",
+    # Single, public cloudpickle spec (a range satisfied by both the serverless base image's
+    # 3.0.0 and newer 3.x) so requirement capture never sees two conflicting cloudpickles.
+    "cloudpickle>=3.0.0,<4",
+]
 
 # Unity Catalog model-version status string (from MLflow's ModelVersionStatus) that
 # marks a version as fully registered and deployable. Non-READY versions
@@ -339,6 +393,15 @@ def log_and_register(
     modules as code paths, then registers the result to Unity Catalog as
     ``{catalog}.{schema}.{model_name}``.
 
+    An explicit :data:`SERVING_PIP_REQUIREMENTS` list is passed as ``pip_requirements`` so
+    MLflow 3.12 does NOT infer the environment: without it, ``log_model`` runs ``uv export``
+    over the dev ``uv.lock`` and captures all 235 deps — pulling in a private package index
+    and a cloudpickle version conflict (``3.0.0`` vs ``3.1.2``) that fails registration on
+    the serverless GPU node. The curated list yields a clean, public, single-cloudpickle
+    ``requirements.txt``. This is independent of ``env_pack`` (below): ``pip_requirements``
+    governs the log-time requirement capture; ``env_pack`` governs the packed serving image.
+    See :data:`SERVING_PIP_REQUIREMENTS` for the full root cause and cited MLflow behavior.
+
     The express-deployment ``env_pack`` (:data:`ENV_PACK`) is passed to
     ``register_model`` **only** when running on a Databricks serverless runtime, where
     packing the current environment can succeed. Off-runtime (the local-CLI default)
@@ -401,6 +464,11 @@ def log_and_register(
         code_paths=_proxy_code_paths(),
         metadata=metadata,
         signature=CHAT_SIGNATURE,
+        # Explicit curated requirements => MLflow skips env inference (no `uv export` of the
+        # dev uv.lock), so the logged requirements carry no private index and a single
+        # cloudpickle. See SERVING_PIP_REQUIREMENTS for the full root-cause + MLflow 3.12
+        # behavior this relies on.
+        pip_requirements=SERVING_PIP_REQUIREMENTS,
     )
 
     uc = config.unity_catalog

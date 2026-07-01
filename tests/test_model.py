@@ -23,6 +23,7 @@ from multi_adapter_serving.model import (
     CHAT_SIGNATURE,
     CHAT_TASK,
     ENV_PACK,
+    SERVING_PIP_REQUIREMENTS,
     ModelVersionResolutionError,
     MultiLoRAChatModel,
     latest_ready_model_version,
@@ -31,6 +32,43 @@ from multi_adapter_serving.model import (
 from multi_adapter_serving.serving.entrypoint_cmd import build_entrypoint_command
 
 UC_PREFIX = "/Volumes/classic_stable_h0vpq7_catalog/default/weights/multi_lora_vllm"
+
+
+def _requirement_names(requirements: list[str]) -> list[str]:
+    """PEP 508 package names for requirement lines (skips pip options like --index-url)."""
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    names: list[str] = []
+    for line in requirements:
+        try:
+            names.append(Requirement(line).name.lower())
+        except InvalidRequirement:
+            # pip options (e.g. "--extra-index-url ...", "-r ...") are not PEP 508 reqs.
+            continue
+    return names
+
+
+def assert_clean_serving_requirements(requirements: list[str]) -> None:
+    """Guard the register fix: no private index, exactly one cloudpickle, no dev bloat.
+
+    Locks in the curated-``pip_requirements`` behavior that replaced MLflow's ``uv export``
+    of the 235-dep dev ``uv.lock`` (which carried the private ``pypi-proxy.dev.databricks.com``
+    index and a cloudpickle 3.0.0-vs-3.1.2 conflict that failed live registration).
+    """
+    # No private / non-public package index anywhere (neither pip index options nor URLs).
+    joined = "\n".join(requirements)
+    assert "pypi-proxy" not in joined
+    assert "databricks.com" not in joined
+    index_opts = ("--index-url", "--extra-index-url", "-i ")
+    assert not any(line.strip().startswith(index_opts) for line in requirements)
+    names = _requirement_names(requirements)
+    # Exactly one cloudpickle spec => the two-source version conflict is impossible.
+    assert names.count("cloudpickle") == 1
+    # A lean serving set, never the ~235-dep dev lock.
+    assert len(names) < 30
+    # No dev-only tooling leaked in.
+    for dev_only in ("pytest", "ruff", "mypy", "types-pyyaml"):
+        assert dev_only not in names
 
 
 def make_config(**overrides: Any) -> Config:
@@ -173,6 +211,9 @@ def test_log_and_register_assembles_metadata_entrypoint_envpack_and_uc_name() ->
     assert any(p.endswith("/serving/proxy.py") for p in code_paths)
     assert any(p.endswith("/serving/proxy_entrypoint.py") for p in code_paths)
 
+    # --- log_model: explicit curated pip_requirements (NOT inferred from uv.lock) ---
+    assert call["pip_requirements"] == SERVING_PIP_REQUIREMENTS
+
     # --- register_model: env_pack + Unity Catalog three-level name ---
     assert len(fake.register_calls) == 1
     reg = fake.register_calls[0]
@@ -226,6 +267,47 @@ def test_uc_name_uses_db_schema_alias() -> None:
 
     assert name == "cat.sch.mname"
     assert model_mod.log_and_register is log_and_register  # module import sanity
+
+
+def test_log_model_passes_curated_public_requirements() -> None:
+    """Regression: log_model must pass explicit curated pip_requirements.
+
+    The live register failure on the serverless GPU node was MLflow inferring the model
+    environment from our dev ``uv.lock`` (235 deps): it exported a PRIVATE package index
+    (``pypi-proxy.dev.databricks.com``) with no serving-time credentials and a cloudpickle
+    conflict (``3.0.0`` from the base image's ``get_default_pip_requirements`` vs ``3.1.2``
+    from the lock) -> ``ResolutionImpossible``. Passing an explicit ``pip_requirements``
+    makes MLflow skip inference (no ``uv export``) and use ONLY this curated set.
+    """
+    fake = FakeMlflow()
+
+    log_and_register(
+        make_config(),
+        make_manifest(),
+        mlflow_module=fake,
+        configure_tracking=offline_configure_tracking(),
+    )
+
+    call = fake.pyfunc.log_model_calls[0]
+    reqs = call["pip_requirements"]
+    assert reqs == SERVING_PIP_REQUIREMENTS
+    # Clean, public, single-cloudpickle set (the exact properties the live failure violated).
+    assert_clean_serving_requirements(reqs)
+    names = _requirement_names(reqs)
+    # The serving-relevant deps are all present (mlflow-skinny satisfies MLflow's own pin).
+    for expected in (
+        "mlflow-skinny",
+        "vllm",
+        "transformers",
+        "huggingface-hub",
+        "databricks-sdk",
+        "fastapi",
+        "uvicorn",
+        "httpx",
+        "pydantic",
+        "pyyaml",
+    ):
+        assert expected in names
 
 
 def test_log_and_register_logs_to_local_file_store(tmp_path: Path) -> None:
@@ -287,11 +369,21 @@ def test_log_and_register_logs_to_local_file_store(tmp_path: Path) -> None:
     assert version == 1
 
     # --- the model actually logged; the llm/v1/chat serving contract is intact ---
-    logged = Model.load(mlflow.artifacts.download_artifacts(register_calls[0]["model_uri"]))
+    model_dir = mlflow.artifacts.download_artifacts(register_calls[0]["model_uri"])
+    logged = Model.load(model_dir)
     assert logged.metadata["task"] == CHAT_TASK == "llm/v1/chat"
     expected_entrypoint = shlex.join(build_entrypoint_command(config, manifest))
     assert logged.metadata["entrypoint"] == expected_entrypoint
     assert logged.signature == CHAT_SIGNATURE
+
+    # --- MLflow's REAL requirement capture produced a clean requirements.txt ---
+    # This is the direct offline regression for the live register failure: driving the real
+    # log_model with explicit pip_requirements must write a requirements.txt with no private
+    # index and a single cloudpickle (NOT the 235-dep dev uv.lock export).
+    written_reqs = (Path(model_dir) / "requirements.txt").read_text().splitlines()
+    assert_clean_serving_requirements(written_reqs)
+    # MLflow guarantees an mlflow pin; mlflow-skinny satisfies it, so no bare `mlflow` is added.
+    assert "mlflow-skinny" in _requirement_names(written_reqs)
 
 
 def test_env_pack_omitted_when_not_on_databricks_runtime() -> None:
