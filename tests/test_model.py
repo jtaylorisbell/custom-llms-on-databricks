@@ -8,6 +8,7 @@ file store (regression for the live register failure) — see its docstring.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -65,6 +66,25 @@ def make_manifest() -> dict[str, str]:
     }
 
 
+def offline_configure_tracking(
+    user_name: str = "svc-user@example.com",
+) -> Callable[[Any, Config], None]:
+    """A ``configure_tracking`` override that runs the REAL URI+experiment logic offline.
+
+    Delegates to the production ``_configure_databricks_tracking`` but injects a stub user
+    resolver, so no real ``WorkspaceClient`` is built and nothing touches the network. Lets
+    the mocked tests exercise the actual tracking setup (URIs + workspace experiment) while
+    staying fully offline.
+    """
+
+    def _configure(mlflow: Any, config: Config) -> None:
+        model_mod._configure_databricks_tracking(
+            mlflow, config, user_resolver=lambda _profile: user_name
+        )
+
+    return _configure
+
+
 class FakeModelInfo:
     def __init__(self, model_uri: str) -> None:
         self.model_uri = model_uri
@@ -88,16 +108,24 @@ class FakeMlflow:
     def __init__(self) -> None:
         self.pyfunc = FakePyfunc()
         self.register_calls: list[dict[str, Any]] = []
-        # Record the URIs log_and_register points MLflow at (default: Databricks + UC).
-        # Offline: no network — these just capture what would be configured live.
+        # Record what log_and_register points MLflow at before logging (default: Databricks
+        # + UC URIs and a workspace experiment). Offline: no network — these just capture
+        # what would be configured live.
         self.tracking_uri: str | None = None
         self.registry_uri: str | None = None
+        self.experiment_path: str | None = None
 
     def set_tracking_uri(self, uri: str) -> None:
         self.tracking_uri = uri
 
     def set_registry_uri(self, uri: str) -> None:
         self.registry_uri = uri
+
+    def set_experiment(
+        self, experiment_name: str | None = None, experiment_id: str | None = None
+    ) -> None:
+        # mlflow.set_experiment(name) create-if-missing; record the workspace path.
+        self.experiment_path = experiment_name
 
     def register_model(
         self, model_uri: str, name: str, **kwargs: Any
@@ -120,6 +148,8 @@ def test_log_and_register_assembles_metadata_entrypoint_envpack_and_uc_name() ->
         chat_model=object(),
         # Simulate a Databricks serverless runtime so env_pack is applied.
         runtime_detector=lambda: True,
+        # Real URI+experiment setup, but offline (stub user lookup, no WorkspaceClient).
+        configure_tracking=offline_configure_tracking(),
     )
 
     # --- log_model: metadata carries the chat task + the built entrypoint command ---
@@ -150,7 +180,12 @@ def test_log_and_register_assembles_metadata_entrypoint_envpack_and_uc_name() ->
 def test_default_python_model_is_a_chatmodel_and_default_artifact_name() -> None:
     fake = FakeMlflow()
 
-    log_and_register(make_config(), make_manifest(), mlflow_module=fake)
+    log_and_register(
+        make_config(),
+        make_manifest(),
+        mlflow_module=fake,
+        configure_tracking=offline_configure_tracking(),
+    )
 
     call = fake.pyfunc.log_model_calls[0]
     assert isinstance(call["python_model"], MultiLoRAChatModel)
@@ -174,7 +209,12 @@ def test_uc_name_uses_db_schema_alias() -> None:
         }
     )
 
-    name, _ = log_and_register(config, make_manifest(), mlflow_module=fake)
+    name, _ = log_and_register(
+        config,
+        make_manifest(),
+        mlflow_module=fake,
+        configure_tracking=offline_configure_tracking(),
+    )
 
     assert name == "cat.sch.mname"
     assert model_mod.log_and_register is log_and_register  # module import sanity
@@ -196,10 +236,12 @@ def test_log_and_register_logs_to_local_file_store(tmp_path: Path) -> None:
     Before the fix this raised ``NotImplementedError`` at log time; after the fix it
     logs successfully with the chat serving contract intact.
 
-    ``uri_configurator`` is overridden to a no-op so ``log_and_register`` does NOT point
-    MLflow at Databricks + Unity Catalog: this test has already set a tmp file store as
-    the tracking+registry URI below, and that local store must stay in effect to keep the
-    real log path offline.
+    ``configure_tracking`` is overridden to a no-op so ``log_and_register`` does NOT point
+    MLflow at Databricks + Unity Catalog and does NOT look up a workspace user / set a
+    workspace experiment: this test has already set a tmp file store as the tracking+registry
+    URI below (whose Default experiment is used by ``start_run``), and that local store must
+    stay in effect to keep the real log path offline. The no-op skips BOTH the URIs and the
+    experiment/workspace-user lookup, so no ``WorkspaceClient`` is ever constructed.
     """
     mlflow.set_tracking_uri(f"file:{tmp_path / 'mlruns'}")
 
@@ -225,8 +267,9 @@ def test_log_and_register_logs_to_local_file_store(tmp_path: Path) -> None:
             manifest,
             mlflow_module=local_mlflow,
             runtime_detector=lambda: False,
-            # Keep offline: do NOT switch to Databricks/UC; the tmp file store set above stays.
-            uri_configurator=lambda _m, _profile: None,
+            # Keep offline: skip URIs AND experiment/user lookup; the tmp file store set
+            # above (and its Default experiment) stays in effect.
+            configure_tracking=lambda _m, _config: None,
         )
 
     # --- register stayed offline (guarded) and returned our fake version ---
@@ -256,7 +299,12 @@ def test_env_pack_omitted_when_not_on_databricks_runtime() -> None:
     """
     fake = FakeMlflow()
 
-    name, version = log_and_register(make_config(), make_manifest(), mlflow_module=fake)
+    name, version = log_and_register(
+        make_config(),
+        make_manifest(),
+        mlflow_module=fake,
+        configure_tracking=offline_configure_tracking(),
+    )
 
     assert len(fake.register_calls) == 1
     reg = fake.register_calls[0]
@@ -276,6 +324,7 @@ def test_env_pack_applied_on_databricks_serverless_runtime() -> None:
         make_manifest(),
         mlflow_module=fake,
         runtime_detector=lambda: True,
+        configure_tracking=offline_configure_tracking(),
     )
 
     assert len(fake.register_calls) == 1
@@ -285,27 +334,42 @@ def test_env_pack_applied_on_databricks_serverless_runtime() -> None:
     assert version == 7
 
 
-def test_register_path_targets_unity_catalog_registry() -> None:
-    """Regression: register must target the Unity Catalog registry, not a local one.
+def test_register_path_targets_uc_and_ensures_workspace_experiment() -> None:
+    """Regression: register must target the UC registry AND ensure a workspace experiment.
 
-    The live failure logged/registered into a LOCAL sqlite tracking+registry store (no
-    ``set_registry_uri`` / ``databricks-uc`` anywhere), so the three-level UC name became a
-    plain local model name and ``deploy`` failed with ``ResourceDoesNotExist: Registered
-    model ... does not exist`` — the version never landed in Unity Catalog. The fix points
-    MLflow's tracking + registry at Databricks + UC, scoped to ``config.databricks.profile``,
-    BEFORE logging/registering.
+    Two live failures this guards, both from a local CLI with no notebook context:
 
-    Fully offline: the injected fake records the URIs and stubs ``register_model``; no
-    Databricks and no network. This uses the DEFAULT ``uri_configurator`` — the exact live
-    code path — asserting it targets ``databricks-uc://<profile>`` and not a local registry.
+    1. UC registry: the model was logged/registered into a LOCAL sqlite tracking+registry
+       store (no ``set_registry_uri`` / ``databricks-uc`` anywhere), so the three-level UC
+       name became a plain local model name and ``deploy`` failed with ``ResourceDoesNotExist:
+       Registered model ... does not exist``. The fix sets the tracking + registry URIs to
+       Databricks + UC, scoped to ``config.databricks.profile``.
+    2. Workspace experiment: with ``tracking_uri='databricks://<profile>'`` and no notebook,
+       MLflow's default-experiment fallback is ``None`` and the backend REJECTS ``log_model``'s
+       run creation. The fix ensures a workspace experiment ``/Users/{user}/{model_name}``
+       (created if missing) BEFORE logging, deriving the user from the SAME profile.
+
+    Fully offline: ``FakeMlflow`` records ``set_tracking_uri`` / ``set_registry_uri`` /
+    ``set_experiment`` and stubs ``register_model``; the workspace-user lookup is stubbed via
+    :func:`offline_configure_tracking`, so NO real ``WorkspaceClient`` is constructed and
+    nothing touches the network. This exercises the production
+    ``_configure_databricks_tracking`` — only the user lookup is mocked.
     """
     fake = FakeMlflow()
-    config = make_config()  # databricks.profile == "fevm-aws"
+    config = make_config()  # profile == "fevm-aws", model_name == "multi_lora_vllm"
 
-    log_and_register(config, make_manifest(), mlflow_module=fake)
+    log_and_register(
+        config,
+        make_manifest(),
+        mlflow_module=fake,
+        configure_tracking=offline_configure_tracking("dev@example.com"),
+    )
 
-    # Registry -> Unity Catalog (not a local sqlite/file registry); tracking -> the
+    # registry -> Unity Catalog (not a local sqlite/file registry); tracking -> the
     # Databricks workspace; both scoped to the config's OAuth profile.
     assert fake.registry_uri == "databricks-uc://fevm-aws"
     assert fake.registry_uri.startswith("databricks-uc")
     assert fake.tracking_uri == "databricks://fevm-aws"
+    # a WORKSPACE experiment is ensured before logging (valid from a local CLI, no notebook).
+    assert fake.experiment_path == "/Users/dev@example.com/multi_lora_vllm"
+    assert fake.experiment_path.startswith("/")

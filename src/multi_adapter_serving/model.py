@@ -28,16 +28,26 @@ metadata explicitly. That yields a byte-for-byte-equivalent serving contract (ch
 signature + task + entrypoint + env_pack) with no ``predict()`` invocation at log
 time. See :data:`CHAT_SIGNATURE`.
 
-Before logging/registering we point MLflow at the Databricks workspace + Unity Catalog
-model registry, scoped to the config's ``databricks.profile`` (OAuth) — the same profile
-the deploy step's ``WorkspaceClient`` uses. Without this MLflow silently defaults to a
-*local* sqlite tracking+registry store and treats the three-level ``catalog.schema.model``
-name as a plain local model name, so the version is created off in a local registry and
-``deploy`` cannot find the Unity Catalog model. See :func:`_configure_uc_registry`.
+Before logging/registering we prepare MLflow's tracking context, scoped to the config's
+``databricks.profile`` (OAuth) — the same profile the deploy step's ``WorkspaceClient``
+uses (see :func:`_configure_databricks_tracking`). Two things must happen, or the live
+register fails from a local machine:
 
-All MLflow/registry calls are injectable (``mlflow_module``, ``uri_configurator``,
-``runtime_detector``) so authoring can be unit tested with no Databricks and no network —
-tests override the URI configuration to a tmp/local file store and never hit Databricks.
+1. **Tracking + registry URIs** → the Databricks workspace + Unity Catalog registry.
+   Without this MLflow silently defaults to a *local* sqlite tracking+registry store and
+   treats the three-level ``catalog.schema.model`` name as a plain local model name, so the
+   version is created in a local registry and ``deploy`` cannot find the UC model.
+2. **A workspace experiment** → set explicitly. With a ``databricks://`` tracking URI and
+   no notebook context (a local CLI), MLflow's default-experiment fallback resolves to
+   ``None`` and the tracking backend REJECTS ``log_model``'s run creation. We derive a
+   deterministic home-folder path ``/Users/{workspace_user}/{model_name}`` from the same
+   profile and ``set_experiment`` (create-if-missing) so no notebook context is required.
+
+All MLflow/registry calls are injectable (``mlflow_module``, ``configure_tracking``,
+``runtime_detector``) so authoring can be unit tested with no Databricks and no network.
+The tracking setup is a single injectable so a no-op override skips BOTH the URI setting
+and the experiment/workspace-user lookup: offline tests never build a ``WorkspaceClient``
+and the real-mlflow test stays on a tmp/local file store.
 """
 
 from __future__ import annotations
@@ -130,18 +140,58 @@ def _databricks_uc_uris(profile: str) -> tuple[str, str]:
     return f"databricks://{profile}", f"databricks-uc://{profile}"
 
 
-def _configure_uc_registry(mlflow: Any, profile: str) -> None:
-    """Point MLflow's tracking + model registry at Databricks + Unity Catalog.
+def _workspace_user_name(profile: str) -> str:
+    """The current user's ``user_name`` from the Databricks workspace for ``profile``.
 
-    Must run before ``log_model`` / ``register_model`` so the experiment run logs to the
-    Databricks workspace and the model version is created in the Unity Catalog registry.
-    Without it MLflow defaults to a local sqlite tracking+registry store and treats the
-    three-level UC name as a plain local model name, so ``deploy`` cannot find the version
-    at ``{catalog}.{schema}.{model_name}`` (the exact live failure this fixes).
+    Uses the SAME OAuth profile as the tracking/registry URIs and the deploy step's
+    ``WorkspaceClient`` — never a PAT. Called only on the live path; offline tests inject a
+    stub resolver (or skip tracking setup entirely), so no ``WorkspaceClient`` is ever
+    constructed under test.
     """
+    from databricks.sdk import WorkspaceClient
+
+    user_name = WorkspaceClient(profile=profile).current_user.me().user_name
+    if not user_name:
+        raise RuntimeError(
+            f"could not resolve the current user for Databricks profile {profile!r}; "
+            "cannot derive an MLflow experiment path"
+        )
+    return user_name
+
+
+def _experiment_path(user_name: str, model_name: str) -> str:
+    """Deterministic workspace experiment path (created if missing) for the run.
+
+    A user home-folder path — ``/Users/{user_name}/{model_name}`` — so it is a valid
+    workspace experiment from a LOCAL CLI with no notebook context, requiring no new config.
+    """
+    return f"/Users/{user_name}/{model_name}"
+
+
+def _configure_databricks_tracking(
+    mlflow: Any,
+    config: Config,
+    *,
+    user_resolver: Callable[[str], str] = _workspace_user_name,
+) -> None:
+    """Point MLflow at Databricks + Unity Catalog and ensure a workspace experiment.
+
+    Must run before ``log_model`` / ``register_model`` so (1) the run logs to the Databricks
+    workspace and the model version is created in the Unity Catalog registry — not a local
+    sqlite registry, where the three-level UC name would become a plain local model name and
+    ``deploy`` could not find ``{catalog}.{schema}.{model_name}`` — and (2) a valid workspace
+    experiment exists, since with a ``databricks://`` tracking URI and no notebook context
+    MLflow's default-experiment fallback is ``None`` and the backend rejects run creation.
+
+    ``user_resolver`` is injected in tests so the workspace-user lookup never builds a real
+    ``WorkspaceClient`` or touches the network.
+    """
+    profile = config.databricks.profile
     tracking_uri, registry_uri = _databricks_uc_uris(profile)
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_registry_uri(registry_uri)
+    experiment_path = _experiment_path(user_resolver(profile), config.unity_catalog.model_name)
+    mlflow.set_experiment(experiment_path)
 
 
 def _in_databricks_serverless_runtime() -> bool:
@@ -169,14 +219,15 @@ def log_and_register(
     chat_model: Any = None,
     artifact_name: str = DEFAULT_ARTIFACT_NAME,
     runtime_detector: Callable[[], bool] | None = None,
-    uri_configurator: Callable[[Any, str], None] | None = None,
+    configure_tracking: Callable[[Any, Config], None] | None = None,
 ) -> tuple[str, int]:
     """Log the pyfunc model and register it to Unity Catalog.
 
-    Before logging, points MLflow's tracking + model registry at the Databricks workspace
-    and Unity Catalog, scoped to ``config.databricks.profile`` (see
-    :func:`_configure_uc_registry`), so the run logs to the workspace and the model version
-    is created in Unity Catalog rather than a local sqlite registry.
+    Before logging, prepares MLflow's tracking context scoped to ``config.databricks.profile``
+    (see :func:`_configure_databricks_tracking`): points the tracking + model registry at the
+    Databricks workspace + Unity Catalog, and ensures a workspace experiment exists — so the
+    run logs to the workspace, the model version is created in Unity Catalog (not a local
+    sqlite registry), and ``log_model``'s run creation is not rejected from a local CLI.
 
     Logs the model with the explicit ``llm/v1/chat`` signature (:data:`CHAT_SIGNATURE`)
     and ``metadata={'task': 'llm/v1/chat', 'entrypoint': <cmd>}`` plus the proxy
@@ -207,11 +258,12 @@ def log_and_register(
         runtime_detector: Injectable predicate deciding whether ``env_pack`` is applied
             (defaults to :func:`_in_databricks_serverless_runtime`). Overridable in
             tests to exercise both the on-runtime and off-runtime register paths.
-        uri_configurator: Injectable callback ``(mlflow_module, profile) -> None`` that
-            points MLflow's tracking + registry URIs before logging (defaults to
-            :func:`_configure_uc_registry`, which targets Databricks + Unity Catalog).
-            Overridable in tests to a tmp/local file store so authoring stays offline and
-            never hits Databricks.
+        configure_tracking: Injectable callback ``(mlflow_module, config) -> None`` that
+            prepares MLflow's tracking context before logging — tracking + registry URIs and
+            a workspace experiment (defaults to :func:`_configure_databricks_tracking`, which
+            targets Databricks + Unity Catalog). A single seam: a no-op override skips BOTH
+            the URI setting and the experiment/workspace-user lookup, so tests stay offline
+            (tmp/local file store) and never construct a ``WorkspaceClient``.
 
     Returns:
         ``(registered_model_full_name, version)``.
@@ -221,13 +273,15 @@ def log_and_register(
     detect_runtime = (
         runtime_detector if runtime_detector is not None else _in_databricks_serverless_runtime
     )
-    configure_uris = uri_configurator if uri_configurator is not None else _configure_uc_registry
+    configure = (
+        configure_tracking if configure_tracking is not None else _configure_databricks_tracking
+    )
 
-    # Point tracking + registry at Databricks + Unity Catalog BEFORE logging/registering,
-    # scoped to the config's OAuth profile, so the run logs to the workspace and the model
-    # version is created in UC (not a local sqlite registry). Tests override this to a
-    # tmp/local store to stay offline.
-    configure_uris(mlflow, config.databricks.profile)
+    # Prepare tracking BEFORE logging/registering: point tracking + registry at Databricks +
+    # Unity Catalog AND ensure a workspace experiment, scoped to the config's OAuth profile —
+    # so the run logs to the workspace, the version lands in UC (not a local sqlite registry),
+    # and run creation is not rejected from a local CLI. Tests override this to stay offline.
+    configure(mlflow, config)
 
     entrypoint = build_entrypoint_command(config, manifest)
     metadata = {
