@@ -44,3 +44,20 @@ multi-adapter-serve --config config.yaml --steps deploy,smoke
   `pyproject.toml`.
 - `code_source.snapshot.root_path: .` uploads this repo (including `config.yaml`) to the
   node so the `command` can `pip install -e .` and run the CLI.
+
+## macOS gotcha: disable AppleDouble (`._*`) files in the snapshot
+
+If you launch `air run` from **macOS**, export `COPYFILE_DISABLE=1` first:
+
+```bash
+COPYFILE_DISABLE=1 air run --file air/register.yaml -p fevm-aws --watch
+```
+
+macOS's BSD `tar`/`cp` embeds AppleDouble sidecar files (`._<name>`, which carry
+resource forks / extended attributes) into archives. `air` builds the snapshot it
+uploads as a tarball, so without this flag those `._*` entries ride along, get
+extracted next to the real files on the Linux serverless-GPU node, and pollute the
+snapshot tree — which can shadow or confuse file resolution (e.g. the `command`'s
+project-root `find`, or `pip install -e .`). `COPYFILE_DISABLE=1` tells macOS to omit
+the AppleDouble entries so the uploaded tree matches the repo exactly. It's a no-op on
+Linux, so it's safe to leave in your shell profile or a wrapper script.
