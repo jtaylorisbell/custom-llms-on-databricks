@@ -46,4 +46,29 @@ code_source:
     root_path: .
 
 command: |
-  pip install -e . && multi-adapter-serve --config config.yaml --steps register
+  # Resolve the snapshot's project root BEFORE installing/running. On air serverless-GPU
+  # nodes the extracted code_source is NOT guaranteed to be the process CWD, so a bare
+  # `pip install -e .` / CLI call fails with "python: can't open file ...: No such file or
+  # directory". Validated live (air-reg5/reg6 runs): the snapshot mounts at
+  # /databricks/code_source/<snapshot-name> with pyproject.toml one level in, so we locate
+  # pyproject.toml and cd into its directory first.
+  set -e
+  # Primary: the known snapshot mount root.
+  ROOT=$(dirname "$(find /databricks/code_source -maxdepth 3 -name pyproject.toml 2>/dev/null | head -1)")
+  # Fallback 1: the process CWD (in case the snapshot IS the working dir on some runtimes).
+  if [ -z "$ROOT" ] || [ ! -f "$ROOT/pyproject.toml" ]; then
+    ROOT=$(dirname "$(find "$PWD" -maxdepth 3 -name pyproject.toml 2>/dev/null | head -1)")
+  fi
+  # Fallback 2: widen to all of /databricks in case the mount layout changes.
+  if [ -z "$ROOT" ] || [ ! -f "$ROOT/pyproject.toml" ]; then
+    ROOT=$(dirname "$(find /databricks -maxdepth 5 -name pyproject.toml 2>/dev/null | head -1)")
+  fi
+  # Fail loudly if we still can't find the project — better than a cryptic install error.
+  if [ -z "$ROOT" ] || [ ! -f "$ROOT/pyproject.toml" ]; then
+    echo "FATAL: could not locate the snapshot project root (no pyproject.toml under /databricks/code_source, \$PWD, or /databricks)" >&2
+    exit 1
+  fi
+  echo "PROJECT_ROOT=$ROOT"
+  cd "$ROOT"
+  pip install -e .
+  multi-adapter-serve --config config.yaml --steps register

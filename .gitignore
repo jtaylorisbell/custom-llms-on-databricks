@@ -26,3 +26,7 @@ mlflow.db
 
 # Env / secrets
 .env
+
+# Orchestration scratch dirs (never commit)
+.worktrees/
+.polly/
