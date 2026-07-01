@@ -89,10 +89,12 @@ class FakeMlflow:
         self.pyfunc = FakePyfunc()
         self.register_calls: list[dict[str, Any]] = []
 
-    def register_model(self, model_uri: str, name: str, *, env_pack: str) -> FakeModelVersion:
-        self.register_calls.append(
-            {"model_uri": model_uri, "name": name, "env_pack": env_pack}
-        )
+    def register_model(
+        self, model_uri: str, name: str, **kwargs: Any
+    ) -> FakeModelVersion:
+        # Capture kwargs verbatim so tests can assert env_pack is *omitted* off-runtime
+        # (real mlflow.register_model defaults env_pack to None when not passed).
+        self.register_calls.append({"model_uri": model_uri, "name": name, "kwargs": kwargs})
         return FakeModelVersion("7")
 
 
@@ -102,7 +104,12 @@ def test_log_and_register_assembles_metadata_entrypoint_envpack_and_uc_name() ->
     manifest = make_manifest()
 
     name, version = log_and_register(
-        config, manifest, mlflow_module=fake, chat_model=object()
+        config,
+        manifest,
+        mlflow_module=fake,
+        chat_model=object(),
+        # Simulate a Databricks serverless runtime so env_pack is applied.
+        runtime_detector=lambda: True,
     )
 
     # --- log_model: metadata carries the chat task + the built entrypoint command ---
@@ -122,7 +129,7 @@ def test_log_and_register_assembles_metadata_entrypoint_envpack_and_uc_name() ->
     assert len(fake.register_calls) == 1
     reg = fake.register_calls[0]
     assert reg["model_uri"] == "runs:/abc123/model"
-    assert reg["env_pack"] == ENV_PACK == "databricks_model_serving"
+    assert reg["kwargs"]["env_pack"] == ENV_PACK == "databricks_model_serving"
     assert reg["name"] == "classic_stable_h0vpq7_catalog.default.multi_lora_vllm"
 
     # --- return value ---
@@ -184,11 +191,9 @@ def test_log_and_register_logs_to_local_file_store(tmp_path: Path) -> None:
     register_calls: list[dict[str, Any]] = []
 
     def fake_register_model(
-        model_uri: str, name: str, *, env_pack: str
+        model_uri: str, name: str, **kwargs: Any
     ) -> FakeModelVersion:
-        register_calls.append(
-            {"model_uri": model_uri, "name": name, "env_pack": env_pack}
-        )
+        register_calls.append({"model_uri": model_uri, "name": name, "kwargs": kwargs})
         return FakeModelVersion("1")
 
     # Real mlflow.pyfunc (local file store) + a guarded, offline register_model.
@@ -198,11 +203,15 @@ def test_log_and_register_logs_to_local_file_store(tmp_path: Path) -> None:
     manifest = make_manifest()
 
     with mlflow.start_run():
-        name, version = log_and_register(config, manifest, mlflow_module=local_mlflow)
+        # Simulate the local-CLI case (no Databricks runtime): env_pack must be omitted
+        # so this real register path would succeed offline.
+        name, version = log_and_register(
+            config, manifest, mlflow_module=local_mlflow, runtime_detector=lambda: False
+        )
 
     # --- register stayed offline (guarded) and returned our fake version ---
     assert len(register_calls) == 1
-    assert register_calls[0]["env_pack"] == ENV_PACK == "databricks_model_serving"
+    assert "env_pack" not in register_calls[0]["kwargs"]
     assert name == "classic_stable_h0vpq7_catalog.default.multi_lora_vllm"
     assert version == 1
 
@@ -212,3 +221,45 @@ def test_log_and_register_logs_to_local_file_store(tmp_path: Path) -> None:
     expected_entrypoint = shlex.join(build_entrypoint_command(config, manifest))
     assert logged.metadata["entrypoint"] == expected_entrypoint
     assert logged.signature == CHAT_SIGNATURE
+
+
+def test_env_pack_omitted_when_not_on_databricks_runtime() -> None:
+    """Regression: off a Databricks runtime, register must OMIT env_pack.
+
+    The live failure was ``register_model(..., env_pack='databricks_model_serving')``
+    raising ``Failed to parse databricks runtime version 'None'``: env_pack packs the
+    *current* Python env as the serving image and needs a Databricks serverless runtime,
+    which is absent on a local machine. The fix omits env_pack off-runtime so register
+    succeeds locally and still returns a usable UC version (Model Serving builds the env
+    at deploy time from the logged requirements). This uses the REAL default detector —
+    the test process is not a Databricks runtime — so it guards the exact live scenario.
+    """
+    fake = FakeMlflow()
+
+    name, version = log_and_register(make_config(), make_manifest(), mlflow_module=fake)
+
+    assert len(fake.register_calls) == 1
+    reg = fake.register_calls[0]
+    # env_pack is not passed at all -> real mlflow does a plain, serving-valid register.
+    assert "env_pack" not in reg["kwargs"]
+    # register still yields a usable (UC name, version) reference for the deploy step.
+    assert name == "classic_stable_h0vpq7_catalog.default.multi_lora_vllm"
+    assert version == 7
+
+
+def test_env_pack_applied_on_databricks_serverless_runtime() -> None:
+    """On a Databricks serverless runtime, register applies the express env_pack."""
+    fake = FakeMlflow()
+
+    name, version = log_and_register(
+        make_config(),
+        make_manifest(),
+        mlflow_module=fake,
+        runtime_detector=lambda: True,
+    )
+
+    assert len(fake.register_calls) == 1
+    reg = fake.register_calls[0]
+    assert reg["kwargs"]["env_pack"] == ENV_PACK == "databricks_model_serving"
+    assert name == "classic_stable_h0vpq7_catalog.default.multi_lora_vllm"
+    assert version == 7

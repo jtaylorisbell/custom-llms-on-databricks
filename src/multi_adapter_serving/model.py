@@ -5,8 +5,18 @@ Follows the Databricks custom-LLM workflow: we log an MLflow pyfunc model carryi
 ``llm/v1/chat`` model signature. At serving time Databricks launches that
 ``entrypoint`` command as the runtime server on port 8080 (our proxy in front of
 vLLM) — pyfunc ``predict`` is **not** the request path. The proxy modules are
-attached as code paths, and the model is registered to Unity Catalog with the
-express-deployment ``env_pack``.
+attached as code paths, and the model is registered to Unity Catalog.
+
+The express-deployment ``env_pack`` (``databricks_model_serving``) is applied only
+when we are on a Databricks serverless runtime; ``env_pack`` packs the *current*
+Python environment as the serving image and can only run there. Off-runtime — this
+CLI's design case, a local laptop — it raises ``Failed to parse databricks runtime
+version 'None'`` (see :data:`ENV_PACK` and :func:`_in_databricks_serverless_runtime`),
+so we omit it. ``env_pack`` is an express (fast cold-start) optimization, not a
+serving requirement: without it Model Serving builds the environment at deploy time
+from the requirements logged alongside the model (``pyproject.toml`` / ``uv.lock`` /
+``.python-version``), and the serving contract (task, entrypoint, chat signature,
+code paths) is unchanged.
 
 Why a plain ``PythonModel`` instead of MLflow's ``ChatModel`` base class: logging a
 ``ChatModel`` subclass *unconditionally* runs ``predict()`` against a default chat
@@ -25,6 +35,7 @@ tested with no Databricks or MLflow tracking server.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +62,9 @@ CHAT_TASK = "llm/v1/chat"
 # chat schema without going through ChatModel's predict-on-input-example validation.
 CHAT_SIGNATURE = ModelSignature(CHAT_MODEL_INPUT_SCHEMA, CHAT_MODEL_OUTPUT_SCHEMA)
 
-# env_pack that enables express deployments required for custom LLM serving.
+# env_pack that enables express (fast cold-start) deployments for custom LLM serving.
+# Applied only on a Databricks serverless runtime — see log_and_register / the module
+# docstring for why it is skipped off-runtime.
 ENV_PACK = "databricks_model_serving"
 
 # Default run-relative artifact name for the logged model.
@@ -98,6 +111,23 @@ def _default_mlflow() -> Any:
     return mlflow
 
 
+def _in_databricks_serverless_runtime() -> bool:
+    """Whether ``env_pack='databricks_model_serving'`` can pack the serving env here.
+
+    ``env_pack`` tars the *current* Python environment as the serving image, so
+    ``pack_env_for_databricks_model_serving`` first calls
+    ``DatabricksRuntimeVersion.parse()`` (which raises ``Failed to parse databricks
+    runtime version 'None'`` off-runtime), then requires a serverless / *client image*
+    runtime and a model logged on Databricks. We gate on MLflow's own
+    ``is_in_databricks_serverless_runtime`` so this check matches exactly what the
+    packer needs; from a local machine it is ``False`` and ``env_pack`` must be skipped.
+    """
+    from mlflow.utils.databricks_utils import is_in_databricks_serverless_runtime
+
+    # mlflow's databricks_utils is untyped; coerce its truthy/None result to bool.
+    return bool(is_in_databricks_serverless_runtime())  # type: ignore[no-untyped-call]
+
+
 def log_and_register(
     config: Config,
     manifest: dict[str, str],
@@ -105,13 +135,21 @@ def log_and_register(
     mlflow_module: Any = None,
     chat_model: Any = None,
     artifact_name: str = DEFAULT_ARTIFACT_NAME,
+    runtime_detector: Callable[[], bool] | None = None,
 ) -> tuple[str, int]:
     """Log the pyfunc model and register it to Unity Catalog.
 
     Logs the model with the explicit ``llm/v1/chat`` signature (:data:`CHAT_SIGNATURE`)
     and ``metadata={'task': 'llm/v1/chat', 'entrypoint': <cmd>}`` plus the proxy
     modules as code paths, then registers the result to Unity Catalog as
-    ``{catalog}.{schema}.{model_name}`` with the express-deployment ``env_pack``.
+    ``{catalog}.{schema}.{model_name}``.
+
+    The express-deployment ``env_pack`` (:data:`ENV_PACK`) is passed to
+    ``register_model`` **only** when running on a Databricks serverless runtime, where
+    packing the current environment can succeed. Off-runtime (the local-CLI default)
+    ``env_pack`` is omitted so registration completes and still produces a deployable
+    UC version — Model Serving resolves the environment at deploy time from the logged
+    requirements. See the module docstring and :func:`_in_databricks_serverless_runtime`.
 
     No ``input_example`` is passed: an input example (or the ChatModel base class)
     would make MLflow validate the model by calling the intentionally-raising
@@ -127,12 +165,18 @@ def log_and_register(
         chat_model: Injectable python_model instance (defaults to
             :class:`MultiLoRAChatModel`).
         artifact_name: Run-relative MLflow model artifact name.
+        runtime_detector: Injectable predicate deciding whether ``env_pack`` is applied
+            (defaults to :func:`_in_databricks_serverless_runtime`). Overridable in
+            tests to exercise both the on-runtime and off-runtime register paths.
 
     Returns:
         ``(registered_model_full_name, version)``.
     """
     mlflow = mlflow_module if mlflow_module is not None else _default_mlflow()
     model = chat_model if chat_model is not None else MultiLoRAChatModel()
+    detect_runtime = (
+        runtime_detector if runtime_detector is not None else _in_databricks_serverless_runtime
+    )
 
     entrypoint = build_entrypoint_command(config, manifest)
     metadata = {
@@ -151,9 +195,15 @@ def log_and_register(
 
     uc = config.unity_catalog
     registered_name = f"{uc.catalog}.{uc.db_schema}.{uc.model_name}"
+    # Pass env_pack only where it can actually pack the environment (Databricks
+    # serverless); off-runtime we omit it so register succeeds locally and Model
+    # Serving builds the env at deploy time from the logged requirements.
+    register_kwargs: dict[str, Any] = {}
+    if detect_runtime():
+        register_kwargs["env_pack"] = ENV_PACK
     model_version = mlflow.register_model(
         model_info.model_uri,
         registered_name,
-        env_pack=ENV_PACK,
+        **register_kwargs,
     )
     return registered_name, int(model_version.version)

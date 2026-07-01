@@ -271,7 +271,8 @@ def _print_dry_run_plan(config: Config, steps: list[str]) -> None:
                   f"({config.source_type}) under {volume_prefix}/")
         elif step == "register":
             print(f"  [register] would log the pyfunc chat model and register it as "
-                  f"{model_full_name} (env_pack=databricks_model_serving)")
+                  f"{model_full_name} (env_pack=databricks_model_serving only on a "
+                  f"Databricks serverless runtime; omitted when run locally)")
         elif step == "deploy":
             print(f"  [deploy]   would create/update endpoint {serving.endpoint_name!r} "
                   f"({serving.workload_type}/{serving.workload_size}, "
