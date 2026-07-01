@@ -13,12 +13,20 @@ Implements the Databricks custom-LLM deployment steps as one command, in order:
 
 Run a subset with ``--steps`` and preview without side effects with ``--dry-run``.
 
-A subset that omits ``stage`` still works: because staged Unity Catalog paths are
-deterministic, ``register`` reconstructs the staging manifest from config
-(:func:`~multi_adapter_serving.staging.staged_manifest`) instead of re-uploading
-weights. This makes register/deploy/smoke cheap to re-run against weights already
-staged in UC. ``deploy`` still requires ``register`` in the same run (it needs the
-freshly registered UC model version).
+Any subset works — no step has an in-run prerequisite:
+
+* ``register`` omitting ``stage``: staged Unity Catalog paths are deterministic, so
+  ``register`` reconstructs the staging manifest from config
+  (:func:`~multi_adapter_serving.staging.staged_manifest`) instead of re-uploading weights.
+* ``deploy`` omitting ``register``: ``register`` now runs remotely on serverless GPU via
+  the AI Runtime CLI (``air``) — env_pack can only be packed there — so the UC model version
+  is created out-of-process. When there is no in-run version, ``deploy`` resolves the latest
+  READY UC version of ``{catalog}.{schema}.{model_name}`` from the registry
+  (:func:`~multi_adapter_serving.model.latest_ready_model_version`) and deploys it. A same-run
+  ``register`` (full local run) still takes precedence.
+
+This makes register/deploy/smoke cheap to re-run against weights already staged in UC, and
+lets the local ``deploy,smoke`` tail follow a remote ``air``-driven register.
 
 Usage::
 
@@ -26,6 +34,8 @@ Usage::
     multi-adapter-serve --config config.yaml --steps stage,register
     # resume off already-staged UC weights (no re-upload):
     multi-adapter-serve --config config.yaml --steps register,deploy,smoke
+    # deploy the latest READY UC version (register ran remotely via `air`):
+    multi-adapter-serve --config config.yaml --steps deploy,smoke
     multi-adapter-serve --config config.yaml --steps smoke
     multi-adapter-serve --config config.yaml --dry-run
 """
@@ -49,7 +59,11 @@ from multi_adapter_serving.deploy import (
     EndpointDeploymentError,
     deploy_endpoint,
 )
-from multi_adapter_serving.model import log_and_register
+from multi_adapter_serving.model import (
+    ModelVersionResolutionError,
+    latest_ready_model_version,
+    log_and_register,
+)
 from multi_adapter_serving.smoke_test import smoke_test
 from multi_adapter_serving.staging import stage_weights, staged_manifest
 
@@ -64,18 +78,25 @@ CANONICAL_STEPS: tuple[str, ...] = ("stage", "register", "deploy", "smoke")
 _STEP_ALIASES = {"smoke-test": "smoke", "smoketest": "smoke"}
 
 # Each step's required predecessor that must also be selected, so its output is
-# produced within the same run. Steps not listed have no in-run prerequisite:
+# produced within the same run. There are no in-run prerequisites left — every step
+# can start from state already durably present in Unity Catalog / the endpoint:
 #
 # * ``stage`` needs nothing.
 # * ``register`` does NOT require ``stage``. Staged UC paths are deterministic, so
 #   when ``stage`` is not selected the manifest is reconstructed from config
 #   (:func:`staged_manifest`) and register runs against weights already in Unity
 #   Catalog — no multi-GB re-upload just to iterate on register/deploy/smoke.
-# * ``deploy`` still requires ``register`` in the same run: it needs the freshly
-#   registered UC model + version, which are assigned by the registry and cannot be
-#   derived from config (and we make no live calls to look them up here).
+# * ``deploy`` does NOT require ``register`` in the same run. ``register`` now runs
+#   remotely on serverless GPU via ``air`` (env_pack can only be produced there), so
+#   the UC version is created out-of-process. When no in-run version exists, ``deploy``
+#   resolves the latest READY UC version of ``{catalog}.{schema}.{model_name}`` from the
+#   registry (:func:`latest_ready_model_version`); a same-run ``register`` still takes
+#   precedence (full local run).
 # * ``smoke`` can query a pre-existing endpoint.
-_STEP_REQUIRES = {"deploy": "register"}
+#
+# The mapping is kept (empty) so the fail-fast dependency check stays wired for any
+# future step that gains an in-run prerequisite.
+_STEP_REQUIRES: dict[str, str] = {}
 
 # Process exit codes. Distinct codes let callers tell the failure modes apart.
 EXIT_OK = 0
@@ -127,7 +148,12 @@ def main(argv: list[str] | None = None) -> int:
     except CliError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
-    except (EndpointDeploymentError, FileNotFoundError, DatabricksError) as exc:
+    except (
+        EndpointDeploymentError,
+        ModelVersionResolutionError,
+        FileNotFoundError,
+        DatabricksError,
+    ) as exc:
         # Expected operational failures: report concisely, no traceback.
         print(f"error: pipeline step failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_OPERATIONAL
@@ -263,9 +289,17 @@ def _run_register(config: Config, state: _PipelineState) -> None:
 
 def _run_deploy(config: Config, state: _PipelineState) -> None:
     if state.model_full_name is None or state.model_version is None:
-        raise CliError(
-            "step 'deploy' requires a registered model + version; "
-            "include 'register' in --steps"
+        # No in-run 'register' produced a version (e.g. register ran remotely on
+        # serverless GPU via `air`, out-of-process). Resolve the latest READY UC
+        # version of {catalog}.{schema}.{model_name} from the registry and deploy it.
+        # A same-run register (full local run) always sets these first and is preferred.
+        print(
+            "==> deploy: no in-run model version; resolving the latest READY Unity "
+            "Catalog version ..."
+        )
+        state.model_full_name, state.model_version = latest_ready_model_version(config)
+        print(
+            f"==> deploy: resolved {state.model_full_name} version {state.model_version}"
         )
     print("==> deploy: creating/updating the serving endpoint ...")
     state.deployment = deploy_endpoint(
@@ -307,9 +341,14 @@ def _print_dry_run_plan(config: Config, steps: list[str]) -> None:
                   f"env_pack=databricks_model_serving only on a Databricks serverless "
                   f"runtime, omitted when run locally)")
         elif step == "deploy":
+            version_note = (
+                "in-run registered version"
+                if "register" in steps
+                else f"latest READY UC version of {model_full_name}"
+            )
             print(f"  [deploy]   would create/update endpoint {serving.endpoint_name!r} "
                   f"({serving.workload_type}/{serving.workload_size}, "
-                  f"scale_to_zero={serving.scale_to_zero})")
+                  f"scale_to_zero={serving.scale_to_zero}; {version_note})")
         elif step == "smoke":
             print(f"  [smoke]    would query endpoint {serving.endpoint_name!r} "
                   f"for adapters: {adapters}")

@@ -64,6 +64,9 @@ class Recorder:
     ) -> None:
         self.order: list[str] = []
         self.calls: dict[str, Any] = {}
+        # How many times deploy fell back to resolving the latest READY UC version
+        # (i.e. no in-run register produced a version).
+        self.resolve_calls = 0
         self._smoke_results = smoke_results if smoke_results is not None else dict(_ALL_PASS_SMOKE)
         self._fail_step = fail_step
         self._fail_exc = fail_exc if fail_exc is not None else RuntimeError("boom")
@@ -71,6 +74,7 @@ class Recorder:
         monkeypatch.setattr(cli, "load_config", lambda path: make_config())
         monkeypatch.setattr(cli, "stage_weights", self._stage)
         monkeypatch.setattr(cli, "log_and_register", self._register)
+        monkeypatch.setattr(cli, "latest_ready_model_version", self._resolve)
         monkeypatch.setattr(cli, "deploy_endpoint", self._deploy)
         monkeypatch.setattr(cli, "smoke_test", self._smoke)
 
@@ -89,6 +93,13 @@ class Recorder:
         self.calls["register"] = {"manifest": manifest}
         self._maybe_fail("register")
         return "classic_stable_h0vpq7_catalog.default.multi_lora_vllm", 7
+
+    def _resolve(self, config: Config) -> tuple[str, int]:
+        # Distinct version (9) from in-run register (7) so tests can tell which path
+        # supplied deploy's version.
+        self.resolve_calls += 1
+        self._maybe_fail("resolve")
+        return "classic_stable_h0vpq7_catalog.default.multi_lora_vllm", 9
 
     def _deploy(
         self, config: Config, model_full_name: str, model_version: int
@@ -126,6 +137,9 @@ def test_full_pipeline_runs_all_steps_in_order(monkeypatch: pytest.MonkeyPatch) 
     }
     assert rec.calls["deploy"]["name"] == "classic_stable_h0vpq7_catalog.default.multi_lora_vllm"
     assert rec.calls["deploy"]["version"] == 7
+    # A full local run has an in-run registered version, so deploy does NOT fall back to
+    # resolving the latest READY UC version.
+    assert rec.resolve_calls == 0
 
 
 def test_steps_subset_runs_only_requested(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -220,19 +234,22 @@ def test_full_run_prefers_real_staged_manifest_over_reconstruction(
     assert rec.calls["register"]["manifest"] != _RECONSTRUCTED_MANIFEST
 
 
-def test_deploy_still_requires_register_in_same_run(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_deploy_smoke_standalone_resolves_latest_ready_uc_version(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rec = Recorder(monkeypatch)
 
-    # Relaxing register's stage requirement does NOT relax deploy's need for a
-    # freshly registered version: --steps deploy (or deploy,smoke) is still rejected.
+    # deploy,smoke without register is now valid: register runs remotely via `air`, so
+    # deploy resolves the latest READY UC version out-of-process and deploys it.
     rc = cli.main(["--config", "config.yaml", "--steps", "deploy,smoke"])
 
-    assert rc == cli.EXIT_USAGE
-    assert rec.order == []
-    err = capsys.readouterr().err
-    assert "requires" in err and "register" in err
+    assert rc == cli.EXIT_OK
+    assert rec.order == ["deploy", "smoke"]
+    assert "register" not in rec.order
+    # deploy used the version resolved from the UC registry (9), not an in-run register (7).
+    assert rec.resolve_calls == 1
+    assert rec.calls["deploy"]["name"] == "classic_stable_h0vpq7_catalog.default.multi_lora_vllm"
+    assert rec.calls["deploy"]["version"] == 9
 
 
 def test_dry_run_makes_no_real_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -246,15 +263,44 @@ def test_dry_run_makes_no_real_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     assert rec.calls == {}
 
 
-def test_deploy_without_register_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_deploy_standalone_resolves_latest_ready_uc_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     rec = Recorder(monkeypatch)
 
     rc = cli.main(["--config", "config.yaml", "--steps", "deploy"])
 
-    # Missing prerequisite (no registered version) is a clean error, not a crash,
-    # and is caught up front before any step runs.
-    assert rc == cli.EXIT_USAGE
-    assert rec.order == []
+    # deploy alone runs standalone now: it resolves the latest READY UC version.
+    assert rc == cli.EXIT_OK
+    assert rec.order == ["deploy"]
+    assert rec.resolve_calls == 1
+    assert rec.calls["deploy"]["version"] == 9
+
+
+def test_deploy_errors_cleanly_when_no_ready_uc_version(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from multi_adapter_serving.model import ModelVersionResolutionError
+
+    rec = Recorder(
+        monkeypatch,
+        fail_step="resolve",
+        fail_exc=ModelVersionResolutionError(
+            "no READY Unity Catalog version of "
+            "'classic_stable_h0vpq7_catalog.default.multi_lora_vllm' found"
+        ),
+    )
+
+    rc = cli.main(["--config", "config.yaml", "--steps", "deploy"])
+
+    # No deployable version is a clean operational exit (no traceback), not a crash.
+    assert rc == cli.EXIT_OPERATIONAL
+    assert rec.resolve_calls == 1
+    assert "deploy" not in rec.calls  # deploy_endpoint never reached
+    captured = capsys.readouterr()
+    assert "no READY" in captured.err
+    assert "Traceback" not in captured.err
+    assert "Traceback" not in captured.out
 
 
 def test_unknown_step_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -348,21 +394,20 @@ def test_unexpected_step_error_is_caught(monkeypatch: pytest.MonkeyPatch) -> Non
     assert rc == cli.EXIT_OPERATIONAL
 
 
-# --- HARDENING B: invalid --steps subset fails fast, no side effects ---------------
+# --- relaxed dependencies: no step has an in-run prerequisite ----------------------
 
 
-def test_invalid_subset_fails_fast_with_no_side_effects(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_stage_deploy_without_register_resolves_uc_version(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rec = Recorder(monkeypatch)
 
-    # deploy needs register in the same run; with only stage+deploy selected this is
-    # rejected BEFORE staging real weights.
+    # No step has an in-run prerequisite anymore, so stage,deploy is accepted. With no
+    # in-run register, deploy resolves the latest READY UC version rather than erroring.
     rc = cli.main(["--config", "config.yaml", "--steps", "stage,deploy"])
 
-    assert rc == cli.EXIT_USAGE
-    # No step ran at all — in particular, stage did not download/upload anything.
-    assert rec.order == []
-    assert rec.calls == {}
-    err = capsys.readouterr().err
-    assert "requires" in err and "register" in err
+    assert rc == cli.EXIT_OK
+    assert rec.order == ["stage", "deploy"]
+    assert "register" not in rec.order
+    assert rec.resolve_calls == 1
+    assert rec.calls["deploy"]["version"] == 9

@@ -1,0 +1,49 @@
+# Databricks AI Runtime (`air`) workload spec: run ONLY the `register` step on a
+# serverless GPU node.
+#
+# Why remote: our custom-LLM served entity can only deploy as an *express deployment*,
+# which requires `env_pack='databricks_model_serving'` at register time. env_pack packs
+# the current Python environment as the serving image and can ONLY be produced on a
+# Databricks serverless GPU runtime — not a laptop. `air run` executes this code on the
+# serverless-GPU client image, where `is_in_databricks_serverless_runtime()` is True, so
+# model.py's env_pack gate fires and MLflow auth switches to ambient job credentials
+# (no ~/.databrickscfg / no profile on the node).
+#
+# stage / deploy / smoke stay local. Run this, then locally:
+#   multi-adapter-serve --config config.yaml --steps deploy,smoke
+# See air/README.md for the full one-liner and prerequisites.
+
+# air requires a simple alnum/hyphen/underscore experiment name (NOT a workspace path).
+experiment_name: multi_lora_vllm_register
+
+compute:
+  num_accelerators: 1
+  accelerator_type: GPU_1xA10
+
+environment:
+  # Serverless environment version 4 (Python 3.12.3).
+  version: "4"
+  # Mirror pyproject.toml's runtime dependencies so `pip install -e .` resolves on the
+  # node. vLLM is Linux-gated in pyproject; the serverless node is Linux, so it is listed
+  # unconditionally here. Versions are kept in lockstep with pyproject.toml.
+  dependencies:
+    - "mlflow[databricks]==3.12.0"
+    - "vllm==0.11.2"
+    - "transformers==4.57.6"
+    - "huggingface-hub>=0.34.0,<1.0"
+    - "databricks-sdk>=0.102.0"
+    - "fastapi>=0.138.0"
+    - "httpx>=0.28.1"
+    - "pydantic>=2"
+    - "uvicorn>=0.49.0"
+    - "pyyaml>=6.0.3"
+
+code_source:
+  # Snapshot the current project directory (this repo, incl. config.yaml + src/) onto
+  # the node so `pip install -e .` and the CLI have the package to install and run.
+  type: snapshot
+  snapshot:
+    root_path: .
+
+command: |
+  pip install -e . && multi-adapter-serve --config config.yaml --steps register

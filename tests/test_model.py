@@ -23,7 +23,9 @@ from multi_adapter_serving.model import (
     CHAT_SIGNATURE,
     CHAT_TASK,
     ENV_PACK,
+    ModelVersionResolutionError,
     MultiLoRAChatModel,
+    latest_ready_model_version,
     log_and_register,
 )
 from multi_adapter_serving.serving.entrypoint_cmd import build_entrypoint_command
@@ -78,8 +80,14 @@ def offline_configure_tracking(
     """
 
     def _configure(mlflow: Any, config: Config) -> None:
+        # Pin the LOCAL branch (runtime_detector -> False) so these mocked tests
+        # deterministically exercise the profile-scoped URIs + workspace experiment,
+        # regardless of where the suite runs.
         model_mod._configure_databricks_tracking(
-            mlflow, config, user_resolver=lambda _profile: user_name
+            mlflow,
+            config,
+            user_resolver=lambda _profile: user_name,
+            runtime_detector=lambda: False,
         )
 
     return _configure
@@ -373,3 +381,137 @@ def test_register_path_targets_uc_and_ensures_workspace_experiment() -> None:
     # a WORKSPACE experiment is ensured before logging (valid from a local CLI, no notebook).
     assert fake.experiment_path == "/Users/dev@example.com/multi_lora_vllm"
     assert fake.experiment_path.startswith("/")
+
+
+# --- runtime-aware MLflow auth: local (profile) vs serverless (ambient) -----------
+
+
+def test_configure_tracking_local_branch_uses_profile_uris_and_experiment() -> None:
+    """Off a Databricks runtime, MLflow is scoped to the config's OAuth profile.
+
+    Local URIs carry the ``{profile}`` suffix and a workspace experiment is ensured
+    (the local CLI has no notebook context, so the default experiment would be None).
+    """
+    fake = FakeMlflow()
+    config = make_config()  # profile == "fevm-aws", model_name == "multi_lora_vllm"
+
+    model_mod._configure_databricks_tracking(
+        fake,
+        config,
+        user_resolver=lambda _profile: "dev@example.com",
+        runtime_detector=lambda: False,
+    )
+
+    assert fake.tracking_uri == "databricks://fevm-aws"
+    assert fake.registry_uri == "databricks-uc://fevm-aws"
+    assert fake.experiment_path == "/Users/dev@example.com/multi_lora_vllm"
+
+
+def test_configure_tracking_serverless_branch_uses_ambient_uris_without_profile() -> None:
+    """On a Databricks serverless runtime (air job), MLflow uses AMBIENT job auth.
+
+    The node has no ``~/.databrickscfg`` and no ``{profile}``, so the URIs are the bare
+    schemes (no profile suffix), and NO local-profile experiment is derived — the air job
+    already provides the active MLflow run/experiment, and the workspace-user lookup (which
+    needs a profile) must never run here.
+    """
+    fake = FakeMlflow()
+    config = make_config()
+    resolver_calls: list[str] = []
+
+    def _tracking_resolver(profile: str) -> str:
+        resolver_calls.append(profile)
+        return "should-not-be-used@example.com"
+
+    model_mod._configure_databricks_tracking(
+        fake,
+        config,
+        user_resolver=_tracking_resolver,
+        runtime_detector=lambda: True,
+    )
+
+    # Ambient auth: plain schemes, NO "databricks://fevm-aws" / "databricks-uc://fevm-aws".
+    assert fake.tracking_uri == "databricks"
+    assert fake.registry_uri == "databricks-uc"
+    assert "fevm-aws" not in fake.tracking_uri
+    assert "fevm-aws" not in fake.registry_uri
+    # No local-profile experiment derived, and the workspace-user lookup never ran.
+    assert fake.experiment_path is None
+    assert resolver_calls == []
+
+
+# --- deploy-time UC version resolution (registry client fully mocked) --------------
+
+
+class FakeModelVersionRecord:
+    """Minimal stand-in for an MLflow UC ``ModelVersion`` (version + status)."""
+
+    def __init__(self, version: str, status: str) -> None:
+        self.version = version
+        self.status = status
+
+
+class FakeRegistryClient:
+    """Fake MLflow registry client exposing only ``search_model_versions``."""
+
+    def __init__(self, versions: list[FakeModelVersionRecord]) -> None:
+        self._versions = versions
+        self.filters: list[str] = []
+
+    def search_model_versions(self, filter_string: str) -> list[FakeModelVersionRecord]:
+        self.filters.append(filter_string)
+        return list(self._versions)
+
+
+def test_latest_ready_model_version_picks_highest_ready() -> None:
+    client = FakeRegistryClient(
+        [
+            FakeModelVersionRecord("1", "READY"),
+            FakeModelVersionRecord("3", "READY"),
+            FakeModelVersionRecord("2", "READY"),
+        ]
+    )
+
+    name, version = latest_ready_model_version(make_config(), registry_client=client)
+
+    assert name == "classic_stable_h0vpq7_catalog.default.multi_lora_vllm"
+    assert version == 3
+    # Queried the UC registry by the three-level model name.
+    assert client.filters == [
+        "name='classic_stable_h0vpq7_catalog.default.multi_lora_vllm'"
+    ]
+
+
+def test_latest_ready_model_version_ignores_non_ready_versions() -> None:
+    # A higher-numbered version exists but is not READY -> it must be skipped, and the
+    # highest *READY* version is returned instead.
+    client = FakeRegistryClient(
+        [
+            FakeModelVersionRecord("6", "FAILED_REGISTRATION"),
+            FakeModelVersionRecord("4", "READY"),
+            FakeModelVersionRecord("5", "PENDING_REGISTRATION"),
+        ]
+    )
+
+    _, version = latest_ready_model_version(make_config(), registry_client=client)
+
+    assert version == 4
+
+
+def test_latest_ready_model_version_errors_when_none_ready() -> None:
+    client = FakeRegistryClient(
+        [
+            FakeModelVersionRecord("1", "PENDING_REGISTRATION"),
+            FakeModelVersionRecord("2", "FAILED_REGISTRATION"),
+        ]
+    )
+
+    with pytest.raises(ModelVersionResolutionError, match="no READY"):
+        latest_ready_model_version(make_config(), registry_client=client)
+
+
+def test_latest_ready_model_version_errors_when_no_versions_exist() -> None:
+    client = FakeRegistryClient([])
+
+    with pytest.raises(ModelVersionResolutionError, match="multi_lora_vllm"):
+        latest_ready_model_version(make_config(), registry_client=client)

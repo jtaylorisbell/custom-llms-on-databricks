@@ -28,20 +28,30 @@ metadata explicitly. That yields a byte-for-byte-equivalent serving contract (ch
 signature + task + entrypoint + env_pack) with no ``predict()`` invocation at log
 time. See :data:`CHAT_SIGNATURE`.
 
-Before logging/registering we prepare MLflow's tracking context, scoped to the config's
-``databricks.profile`` (OAuth) — the same profile the deploy step's ``WorkspaceClient``
-uses (see :func:`_configure_databricks_tracking`). Two things must happen, or the live
-register fails from a local machine:
+Before logging/registering we prepare MLflow's tracking context, and that setup is
+**runtime-aware** (see :func:`_configure_databricks_tracking`), because register runs in
+two very different places:
 
-1. **Tracking + registry URIs** → the Databricks workspace + Unity Catalog registry.
-   Without this MLflow silently defaults to a *local* sqlite tracking+registry store and
-   treats the three-level ``catalog.schema.model`` name as a plain local model name, so the
-   version is created in a local registry and ``deploy`` cannot find the UC model.
-2. **A workspace experiment** → set explicitly. With a ``databricks://`` tracking URI and
-   no notebook context (a local CLI), MLflow's default-experiment fallback resolves to
-   ``None`` and the tracking backend REJECTS ``log_model``'s run creation. We derive a
-   deterministic home-folder path ``/Users/{workspace_user}/{model_name}`` from the same
-   profile and ``set_experiment`` (create-if-missing) so no notebook context is required.
+* **Local CLI** (off-runtime): scope everything to the config's ``databricks.profile``
+  (OAuth) — the same profile the deploy step's ``WorkspaceClient`` uses. Two things must
+  happen, or the live register fails from a local machine:
+
+  1. **Tracking + registry URIs** → ``databricks://{profile}`` + ``databricks-uc://{profile}``.
+     Without this MLflow silently defaults to a *local* sqlite tracking+registry store and
+     treats the three-level ``catalog.schema.model`` name as a plain local model name, so the
+     version is created in a local registry and ``deploy`` cannot find the UC model.
+  2. **A workspace experiment** → set explicitly. With a ``databricks://`` tracking URI and
+     no notebook context (a local CLI), MLflow's default-experiment fallback resolves to
+     ``None`` and the tracking backend REJECTS ``log_model``'s run creation. We derive a
+     deterministic home-folder path ``/Users/{workspace_user}/{model_name}`` from the same
+     profile and ``set_experiment`` (create-if-missing) so no notebook context is required.
+
+* **Serverless GPU runtime** (e.g. inside an ``air run`` job that runs register remotely):
+  there is NO ``~/.databrickscfg`` and no ``{profile}`` — the node uses ambient Databricks
+  job auth. So we set **ambient** URIs — plain ``databricks`` + ``databricks-uc`` with no
+  profile suffix — and do NOT derive/ensure a local-profile experiment (the air job already
+  provides an active MLflow run/experiment). The same runtime gate that selects ambient auth
+  also fires ``env_pack`` (below), so express packing and ambient auth always agree.
 
 All MLflow/registry calls are injectable (``mlflow_module``, ``configure_tracking``,
 ``runtime_detector``) so authoring can be unit tested with no Databricks and no network.
@@ -68,9 +78,15 @@ __all__ = [
     "CHAT_SIGNATURE",
     "CHAT_TASK",
     "ENV_PACK",
+    "ModelVersionResolutionError",
     "MultiLoRAChatModel",
+    "latest_ready_model_version",
     "log_and_register",
 ]
+
+
+class ModelVersionResolutionError(RuntimeError):
+    """Raised when no READY Unity Catalog model version can be resolved for deploy."""
 
 # Mandatory task tag for the Databricks chat schema (llm/v1/chat).
 CHAT_TASK = "llm/v1/chat"
@@ -87,6 +103,11 @@ ENV_PACK = "databricks_model_serving"
 
 # Default run-relative artifact name for the logged model.
 DEFAULT_ARTIFACT_NAME = "model"
+
+# Unity Catalog model-version status string (from MLflow's ModelVersionStatus) that
+# marks a version as fully registered and deployable. Non-READY versions
+# (PENDING_REGISTRATION / FAILED_REGISTRATION) are skipped by version resolution.
+_READY_STATUS = "READY"
 
 
 class MultiLoRAChatModel(PythonModel):
@@ -140,6 +161,64 @@ def _databricks_uc_uris(profile: str) -> tuple[str, str]:
     return f"databricks://{profile}", f"databricks-uc://{profile}"
 
 
+def _default_registry_client(profile: str) -> Any:
+    """A real MLflow client bound to the Unity Catalog registry (OAuth via ``profile``).
+
+    Constructed with an explicit ``registry_uri`` (``databricks-uc://{profile}``) so it does
+    not depend on any prior global ``set_registry_uri`` — the ``deploy`` step may run in a
+    process where ``register`` never executed (register now runs remotely via ``air``).
+    """
+    from mlflow.tracking import MlflowClient
+
+    _, registry_uri = _databricks_uc_uris(profile)
+    return MlflowClient(registry_uri=registry_uri)
+
+
+def latest_ready_model_version(
+    config: Config,
+    *,
+    registry_client: Any = None,
+) -> tuple[str, int]:
+    """Resolve the highest READY Unity Catalog version of the configured model.
+
+    Supports running ``deploy`` out-of-process from ``register`` (register now runs on a
+    serverless GPU node via ``air``, so the UC version is created in a different process).
+    Queries the Unity Catalog model registry for all versions of
+    ``{catalog}.{schema}.{model_name}`` and returns the greatest version number whose status
+    is ``READY`` — a version still ``PENDING_REGISTRATION`` or ``FAILED_REGISTRATION`` is not
+    deployable and is skipped, even if its number is higher.
+
+    Args:
+        config: Validated configuration (supplies the UC three-level name and the OAuth
+            profile for the default registry client).
+        registry_client: Injectable MLflow registry client exposing
+            ``search_model_versions(filter_string)``. Defaults to an ``MlflowClient`` bound to
+            ``databricks-uc://{profile}``. Overridable in tests so no live registry is hit.
+
+    Returns:
+        ``(registered_model_full_name, version)`` for the latest READY version.
+
+    Raises:
+        ModelVersionResolutionError: If the model has no READY version in Unity Catalog.
+    """
+    uc = config.unity_catalog
+    full_name = f"{uc.catalog}.{uc.db_schema}.{uc.model_name}"
+    client = (
+        registry_client
+        if registry_client is not None
+        else _default_registry_client(config.databricks.profile)
+    )
+    versions = client.search_model_versions(f"name='{full_name}'")
+    ready = [v for v in versions if getattr(v, "status", None) == _READY_STATUS]
+    if not ready:
+        raise ModelVersionResolutionError(
+            f"no READY Unity Catalog version of {full_name!r} found; register the model "
+            "first (e.g. `air run --file air/register.yaml -p <profile> --watch`)"
+        )
+    latest = max(ready, key=lambda v: int(v.version))
+    return full_name, int(latest.version)
+
+
 def _workspace_user_name(profile: str) -> str:
     """The current user's ``user_name`` from the Databricks workspace for ``profile``.
 
@@ -168,32 +247,6 @@ def _experiment_path(user_name: str, model_name: str) -> str:
     return f"/Users/{user_name}/{model_name}"
 
 
-def _configure_databricks_tracking(
-    mlflow: Any,
-    config: Config,
-    *,
-    user_resolver: Callable[[str], str] = _workspace_user_name,
-) -> None:
-    """Point MLflow at Databricks + Unity Catalog and ensure a workspace experiment.
-
-    Must run before ``log_model`` / ``register_model`` so (1) the run logs to the Databricks
-    workspace and the model version is created in the Unity Catalog registry — not a local
-    sqlite registry, where the three-level UC name would become a plain local model name and
-    ``deploy`` could not find ``{catalog}.{schema}.{model_name}`` — and (2) a valid workspace
-    experiment exists, since with a ``databricks://`` tracking URI and no notebook context
-    MLflow's default-experiment fallback is ``None`` and the backend rejects run creation.
-
-    ``user_resolver`` is injected in tests so the workspace-user lookup never builds a real
-    ``WorkspaceClient`` or touches the network.
-    """
-    profile = config.databricks.profile
-    tracking_uri, registry_uri = _databricks_uc_uris(profile)
-    mlflow.set_tracking_uri(tracking_uri)
-    mlflow.set_registry_uri(registry_uri)
-    experiment_path = _experiment_path(user_resolver(profile), config.unity_catalog.model_name)
-    mlflow.set_experiment(experiment_path)
-
-
 def _in_databricks_serverless_runtime() -> bool:
     """Whether ``env_pack='databricks_model_serving'`` can pack the serving env here.
 
@@ -204,11 +257,63 @@ def _in_databricks_serverless_runtime() -> bool:
     runtime and a model logged on Databricks. We gate on MLflow's own
     ``is_in_databricks_serverless_runtime`` so this check matches exactly what the
     packer needs; from a local machine it is ``False`` and ``env_pack`` must be skipped.
+
+    This same predicate also decides the register step's MLflow auth mode (see
+    :func:`_configure_databricks_tracking`): serverless -> ambient job auth, local ->
+    profile-scoped auth.
     """
     from mlflow.utils.databricks_utils import is_in_databricks_serverless_runtime
 
     # mlflow's databricks_utils is untyped; coerce its truthy/None result to bool.
     return bool(is_in_databricks_serverless_runtime())  # type: ignore[no-untyped-call]
+
+
+def _configure_databricks_tracking(
+    mlflow: Any,
+    config: Config,
+    *,
+    user_resolver: Callable[[str], str] = _workspace_user_name,
+    runtime_detector: Callable[[], bool] = _in_databricks_serverless_runtime,
+) -> None:
+    """Point MLflow at Databricks + Unity Catalog, runtime-aware.
+
+    The register step runs in two very different environments, so auth is configured
+    differently in each (``runtime_detector`` decides which):
+
+    * **Serverless GPU runtime** (``runtime_detector()`` is ``True`` — e.g. inside an
+      ``air run`` job): there is NO ``~/.databrickscfg`` and no ``{profile}``; the node
+      authenticates with ambient Databricks job credentials. So we set **ambient** URIs —
+      plain ``databricks`` tracking + ``databricks-uc`` registry, with NO profile suffix —
+      and we do NOT derive/ensure a local-profile experiment (the air job already provides
+      an active MLflow run/experiment). Deriving ``/Users/{profile-user}/...`` here would be
+      wrong (no profile) and unnecessary.
+
+    * **Local CLI** (``runtime_detector()`` is ``False``, the default off-runtime): scope
+      everything to ``config.databricks.profile`` (OAuth). This must run before
+      ``log_model`` / ``register_model`` so (1) the run logs to the Databricks workspace and
+      the model version is created in the Unity Catalog registry — not a local sqlite
+      registry, where the three-level UC name would become a plain local model name and
+      ``deploy`` could not find ``{catalog}.{schema}.{model_name}`` — and (2) a valid
+      workspace experiment exists, since with a ``databricks://`` tracking URI and no
+      notebook context MLflow's default-experiment fallback is ``None`` and the backend
+      rejects run creation. We ensure ``/Users/{workspace_user}/{model_name}``.
+
+    ``user_resolver`` (local branch only) and ``runtime_detector`` are injected in tests so
+    neither branch builds a real ``WorkspaceClient`` or touches the network. This same
+    ``runtime_detector`` gate matches the env_pack gate in :func:`log_and_register`: on a
+    serverless runtime BOTH fire (ambient auth here, ``env_pack`` there).
+    """
+    if runtime_detector():
+        # Serverless GPU (air job): ambient job auth — no profile, no experiment path.
+        mlflow.set_tracking_uri("databricks")
+        mlflow.set_registry_uri("databricks-uc")
+        return
+    profile = config.databricks.profile
+    tracking_uri, registry_uri = _databricks_uc_uris(profile)
+    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_registry_uri(registry_uri)
+    experiment_path = _experiment_path(user_resolver(profile), config.unity_catalog.model_name)
+    mlflow.set_experiment(experiment_path)
 
 
 def log_and_register(
