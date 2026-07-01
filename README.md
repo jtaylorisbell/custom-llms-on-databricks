@@ -16,7 +16,7 @@ Nothing here is hardcoded to a specific model — everything is driven by config
 src/multi_adapter_serving/
   config.py      # pydantic schema + load_config()
   staging.py     # stage_weights() — HF/local -> Unity Catalog Volume
-  model.py       # log_and_register() — MLflow ChatModel -> Unity Catalog
+  model.py       # log_and_register() — MLflow pyfunc chat model -> Unity Catalog
   serving/       # entrypoint command + multi-LoRA proxy in front of vLLM
   deploy.py      # deploy_endpoint() — create/update the Serverless GPU endpoint
   client.py      # query() — {adapter, prompt} -> assistant text

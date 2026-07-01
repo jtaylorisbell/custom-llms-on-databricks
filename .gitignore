@@ -20,5 +20,9 @@ config.yaml
 # Local weight cache
 multi_adapter_serving_cache/
 
+# Local MLflow tracking artifacts (tests use temp stores; these are stray local runs)
+mlruns/
+mlflow.db
+
 # Env / secrets
 .env

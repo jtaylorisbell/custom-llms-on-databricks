@@ -4,7 +4,7 @@ Implements the Databricks custom-LLM deployment steps as one command, in order:
 
 1. ``stage``    — download/validate weights into a Unity Catalog Volume
    (:func:`multi_adapter_serving.staging.stage_weights`).
-2. ``register`` — log the ChatModel + register it to Unity Catalog
+2. ``register`` — log the pyfunc chat model + register it to Unity Catalog
    (:func:`multi_adapter_serving.model.log_and_register`).
 3. ``deploy``   — create/update the Serverless GPU serving endpoint
    (:func:`multi_adapter_serving.deploy.deploy_endpoint`).
@@ -270,7 +270,7 @@ def _print_dry_run_plan(config: Config, steps: list[str]) -> None:
             print(f"  [stage]    would stage base + {len(config.adapters)} adapter(s) "
                   f"({config.source_type}) under {volume_prefix}/")
         elif step == "register":
-            print(f"  [register] would log the ChatModel and register it as "
+            print(f"  [register] would log the pyfunc chat model and register it as "
                   f"{model_full_name} (env_pack=databricks_model_serving)")
         elif step == "deploy":
             print(f"  [deploy]   would create/update endpoint {serving.endpoint_name!r} "

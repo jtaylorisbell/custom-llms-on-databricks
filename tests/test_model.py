@@ -1,15 +1,30 @@
-"""Unit tests for model authoring + registration (MLflow fully mocked)."""
+"""Unit tests for model authoring + registration.
+
+Most tests mock MLflow entirely. ``test_log_and_register_logs_to_local_file_store``
+deliberately exercises the *real* ``mlflow.pyfunc.log_model`` path against a temp
+file store (regression for the live register failure) — see its docstring.
+"""
 
 from __future__ import annotations
 
 import shlex
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import mlflow
 import pytest
+from mlflow.models import Model
 
 from multi_adapter_serving import model as model_mod
 from multi_adapter_serving.config import Config
-from multi_adapter_serving.model import CHAT_TASK, ENV_PACK, MultiLoRAChatModel, log_and_register
+from multi_adapter_serving.model import (
+    CHAT_SIGNATURE,
+    CHAT_TASK,
+    ENV_PACK,
+    MultiLoRAChatModel,
+    log_and_register,
+)
 from multi_adapter_serving.serving.entrypoint_cmd import build_entrypoint_command
 
 UC_PREFIX = "/Volumes/classic_stable_h0vpq7_catalog/default/weights/multi_lora_vllm"
@@ -146,3 +161,54 @@ def test_uc_name_uses_db_schema_alias() -> None:
 
     assert name == "cat.sch.mname"
     assert model_mod.log_and_register is log_and_register  # module import sanity
+
+
+def test_log_and_register_logs_to_local_file_store(tmp_path: Path) -> None:
+    """The REAL mlflow log path must succeed offline, without calling predict().
+
+    Regression: the model was previously an MLflow ``ChatModel``, so
+    ``mlflow.pyfunc.log_model`` validated it by running the intentionally-raising
+    ``predict()`` against a default input example ("Predicting on input example to
+    validate output" -> ``NotImplementedError``), which aborted the live register
+    step. The fix logs a plain pyfunc model with an explicit ``llm/v1/chat``
+    signature and no input example.
+
+    This test drives the real ``mlflow.pyfunc.log_model`` against a temp file store
+    (no Databricks / no UC / no network). Only the UC-touching ``register_model``
+    call is stubbed, so the test stays fully offline while proving the model logs.
+    Before the fix this raised ``NotImplementedError`` at log time; after the fix it
+    logs successfully with the chat serving contract intact.
+    """
+    mlflow.set_tracking_uri(f"file:{tmp_path / 'mlruns'}")
+
+    register_calls: list[dict[str, Any]] = []
+
+    def fake_register_model(
+        model_uri: str, name: str, *, env_pack: str
+    ) -> FakeModelVersion:
+        register_calls.append(
+            {"model_uri": model_uri, "name": name, "env_pack": env_pack}
+        )
+        return FakeModelVersion("1")
+
+    # Real mlflow.pyfunc (local file store) + a guarded, offline register_model.
+    local_mlflow = SimpleNamespace(pyfunc=mlflow.pyfunc, register_model=fake_register_model)
+
+    config = make_config()
+    manifest = make_manifest()
+
+    with mlflow.start_run():
+        name, version = log_and_register(config, manifest, mlflow_module=local_mlflow)
+
+    # --- register stayed offline (guarded) and returned our fake version ---
+    assert len(register_calls) == 1
+    assert register_calls[0]["env_pack"] == ENV_PACK == "databricks_model_serving"
+    assert name == "classic_stable_h0vpq7_catalog.default.multi_lora_vllm"
+    assert version == 1
+
+    # --- the model actually logged; the llm/v1/chat serving contract is intact ---
+    logged = Model.load(mlflow.artifacts.download_artifacts(register_calls[0]["model_uri"]))
+    assert logged.metadata["task"] == CHAT_TASK == "llm/v1/chat"
+    expected_entrypoint = shlex.join(build_entrypoint_command(config, manifest))
+    assert logged.metadata["entrypoint"] == expected_entrypoint
+    assert logged.signature == CHAT_SIGNATURE
