@@ -1,0 +1,19 @@
+resources:
+  jobs:
+    multi_lora:
+      name: multi_lora
+      tasks:
+        - task_key: main
+          notebook_task:
+            notebook_path: /Workspace/Users/taylor.isbell@databricks.com/multi-adapter-serving/notebooks/register
+            source: WORKSPACE
+          environment_key: a_environment
+          compute:
+            hardware_accelerator: GPU_1xA10
+      queue:
+        enabled: true
+      environments:
+        - environment_key: a_environment
+          spec:
+            environment_version: "5"
+      performance_target: PERFORMANCE_OPTIMIZED

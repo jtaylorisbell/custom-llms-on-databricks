@@ -1,0 +1,12 @@
+bundle:
+  name: multi-adapter-serving
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    default: true
+    mode: development
+    workspace:
+      host: https://fevm-classic-stable-h0vpq7.cloud.databricks.com
