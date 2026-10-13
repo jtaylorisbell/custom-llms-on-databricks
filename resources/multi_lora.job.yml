@@ -2,11 +2,14 @@ resources:
   jobs:
     multi_lora:
       name: multi_lora
+      parameters:
+        # deploy: register + create/update the endpoint. verify: stop after the in-notebook test.
+        - name: stage
+          default: deploy
       tasks:
         - task_key: main
           notebook_task:
-            notebook_path: /Workspace/Users/taylor.isbell@databricks.com/multi-adapter-serving/notebooks/register
-            source: WORKSPACE
+            notebook_path: ../notebooks/register.py
           environment_key: a_environment
           compute:
             hardware_accelerator: GPU_1xA10
