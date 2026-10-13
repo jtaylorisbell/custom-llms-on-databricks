@@ -1,65 +1,102 @@
 # multi-adapter-serving
 
-One base model (Mistral-7B-Instruct-v0.2) serving several LoRA adapters from a single Databricks
+Serves Mistral-7B-Instruct-v0.2 and 2 LoRA adapters trained on it, `ner` (entity extraction) and
+`code` (coding), from 1 Databricks
 [custom LLM serving](https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms)
-endpoint (vLLM on `GPU_MEDIUM`, 1x A10G). Custom LLM serving doesn't support LoRA adapters
-natively yet, so the endpoint's entrypoint runs vLLM with `--enable-lora` behind a thin proxy
-(`serving/proxy.py`) that maps `custom_inputs.adapter` onto vLLM's `model` field.
+endpoint on a single A10G (`GPU_MEDIUM`). Each request picks its adapter, so 1 GPU serves all 3
+models.
+
+Custom LLM serving can't select LoRA adapters on its own yet: requests use `model` for the
+endpoint name, and that's the field vLLM uses to pick an adapter. So the endpoint runs vLLM with
+`--enable-lora` behind a thin proxy (`serving/proxy.py`) that reads the adapter from
+`custom_inputs.adapter` and passes it to vLLM.
+
+```
+client --custom_inputs.adapter="ner"--> proxy :8080 --model="ner"--> vLLM (base + ner + code)
+```
 
 ## Layout
 
-- `notebooks/register.py`: downloads any missing weights into the Volume, tests the entrypoint in
-  the notebook, logs and registers the model (`env_pack`), then creates or updates the endpoint.
-- `serving/`: the proxy and its launcher, bundled into the model as artifacts.
-- `resources/multi_lora.job.yml`: Serverless GPU (A10) job that runs the notebook.
-- `scripts/smoke_test.py`: queries the endpoint once per adapter over OAuth.
+- `notebooks/register.py`: downloads any missing weights, tests the serving command, registers the
+  model in Unity Catalog, and creates or updates the endpoint.
+- `serving/`: the proxy and its launcher, bundled into the model with the weights.
+- `resources/multi_lora.job.yml`: the Serverless GPU (A10) job that runs the notebook.
+- `scripts/smoke_test.py`: queries the base model and each adapter over OAuth.
 
 ## Deploy
 
-The weights live at
-`/Volumes/classic_stable_h0vpq7_catalog/default/weights/multi_lora_vllm/{base,adapters/<name>}`.
-The first run downloads whatever is missing there from Hugging Face (`HF_REPOS` in the notebook,
-about 14 GB, no token needed); later runs reuse it.
-
 ```bash
 databricks bundle deploy -p fevm-aws
-databricks bundle run multi_lora -p fevm-aws                        # register + deploy
-databricks bundle run multi_lora -p fevm-aws --params stage=verify  # in-notebook test only
+databricks bundle run multi_lora -p fevm-aws                        # build, register, and deploy
+databricks bundle run multi_lora -p fevm-aws --params stage=verify  # stop after the notebook test
 ```
+
+Each run:
+
+1. Downloads any weights missing from
+   `/Volumes/classic_stable_h0vpq7_catalog/default/weights/multi_lora_vllm/` from Hugging Face
+   (about 14 GB the first time, no token needed).
+2. Runs the serving command in the notebook and checks that the base model and each adapter answer.
+3. Registers a new version of `classic_stable_h0vpq7_catalog.default.multi_lora_vllm`.
+4. Creates the `multi-lora-vllm` endpoint, or moves it to the new version while the current one
+   keeps serving.
+
+A full run takes about 30 minutes.
 
 ## Query
 
 ```bash
-uv run scripts/smoke_test.py --profile fevm-aws
+uv run scripts/smoke_test.py --profile fevm-aws   # base model plus each adapter
 ```
 
-Pick an adapter with `custom_inputs.adapter`; omit it to get the base model:
+Set `custom_inputs.adapter` to pick an adapter, or leave it out for the base model:
 
 ```json
 {"messages": [{"role": "user", "content": "..."}], "custom_inputs": {"adapter": "ner"}}
 ```
 
-With the OpenAI client, pass `extra_body={"custom_inputs": {"adapter": "ner"}}`.
+The reply's `model` field names the model that answered (`base`, `ner`, or `code`). An unknown
+adapter gets HTTP 400 with the list of valid names.
 
-## Lessons from earlier failed deploys
+With the OpenAI client, signed in through your CLI profile:
 
-- Model Serving sends chat requests to `POST /invocations` and probes `GET /v1/models` for
-  readiness. The proxy must serve both, or the endpoint never reaches READY.
-- The serving container runs Databricks' own metrics exporter on port 8081, and it answers every
-  path with 200. vLLM therefore takes a free port picked at startup (`--vllm-port 0`), and the
-  launcher only treats vLLM as ready once `/v1/models` lists the base model. A fixed 8081 worked
-  in July but now crash-loops.
-- The entrypoint runs from the model's `artifacts/` dir, so the weights and the proxy are bundled
-  as artifacts and referenced by bare relative names.
-- Log only `extra_pip_requirements=["mlflow==3.12.0"]`. Listing vllm/transformers makes the serving
-  environment re-resolve an OpenSSL stack whose FIPS self-test fails at startup.
-- Custom LLM endpoints don't autoscale. Size with `workload_size`; the API rejects autoscaling configs.
-- A version's express-deployment staging doesn't last. Redeploying an old version fails with
-  "with entrypoint is only supported with express deployments" until you re-stage it:
-  `databricks api post '/api/2.0/serving-endpoints:stageDeployment' --json '{"model_name": "<catalog.schema.model>", "model_version": "<n>"}'`.
+```python
+from databricks.sdk import WorkspaceClient
+from openai import OpenAI
+
+w = WorkspaceClient(profile="fevm-aws")
+client = OpenAI(
+    base_url=f"{w.config.host}/serving-endpoints",
+    api_key=w.config.authenticate()["Authorization"].removeprefix("Bearer "),
+)
+resp = client.chat.completions.create(
+    model="multi-lora-vllm",
+    messages=[{"role": "user", "content": "Write a Python function that reverses a string."}],
+    extra_body={"custom_inputs": {"adapter": "code"}},
+)
+print(resp.model, resp.choices[0].message.content)
+```
+
+Streaming (`stream=True`) works the same way. SQL `ai_query` can't pass `custom_inputs`, so it
+always gets the base model.
+
+## Add an adapter
+
+1. In `notebooks/register.py`, add its name to `ADAPTERS`, its Volume path to `WEIGHTS`, and its
+   Hugging Face repo to `HF_REPOS` (or copy it into the Volume yourself). It must be a LoRA trained
+   on the same base model.
+2. Set `MAX_LORAS` to the number of adapters so they all stay loaded, and keep `MAX_LORA_RANK` at
+   or above each adapter's rank (`r` in its `adapter_config.json`).
+3. Rerun the job. The notebook test checks the new adapter before anything is registered.
 
 ## Cost
 
-Scale-to-zero is off, so the endpoint bills for its GPU around the clock (about 20 DBU/hour)
-until you delete it. Set `SCALE_TO_ZERO_ENABLED = True` in the notebook to stop idle billing, at
-the cost of a cold start of several minutes on the first request.
+Scale-to-zero is off, so the endpoint bills for its GPU around the clock (about 20 DBU/hour) until
+you delete it:
+
+```bash
+databricks serving-endpoints delete multi-lora-vllm -p fevm-aws
+```
+
+To stop idle billing instead, set `SCALE_TO_ZERO_ENABLED = True` in the notebook and rerun the job.
+The first request after an idle period then waits several minutes while the model loads.
