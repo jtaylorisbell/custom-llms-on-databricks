@@ -34,6 +34,7 @@ from proxy import create_proxy_app
 
 __all__ = [
     "build_vllm_command",
+    "free_port",
     "main",
     "monitor_vllm",
     "parse_adapter_names",

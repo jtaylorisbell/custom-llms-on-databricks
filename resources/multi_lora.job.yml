@@ -3,6 +3,10 @@ resources:
     multi_lora:
       name: multi_lora
       parameters:
+        - name: catalog
+          default: ${var.catalog}
+        - name: schema
+          default: ${var.schema}
         # deploy: register + create/update the endpoint. verify: stop after the in-notebook test.
         - name: stage
           default: deploy

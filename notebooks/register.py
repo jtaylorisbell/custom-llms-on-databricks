@@ -4,16 +4,18 @@
 # MAGIC
 # MAGIC Multi-LoRA adaptation of the Databricks
 # MAGIC [custom LLM serving](https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms)
-# MAGIC starter, run on **Serverless GPU** (A10). One base model serves several LoRA adapters behind a
-# MAGIC thin proxy (`serving/proxy.py`) that maps `custom_inputs.adapter` onto vLLM's `model` field
-# MAGIC (Model Serving occupies `model` with the endpoint name). Requests without an adapter go to the
-# MAGIC base model.
+# MAGIC starter, run on **Serverless GPU** (A10). The base model and its LoRA adapters (here, `ner`)
+# MAGIC share one GPU behind a thin proxy (`serving/proxy.py`) that maps `custom_inputs.adapter` onto
+# MAGIC vLLM's `model` field (Model Serving occupies `model` with the endpoint name). Requests without
+# MAGIC an adapter go to the base model.
 # MAGIC
 # MAGIC The base model, adapters, and proxy are bundled into the logged model as artifacts, so nothing
-# MAGIC is fetched at serve time. The weights must already be staged in the UC Volume below.
+# MAGIC is fetched at serve time. Weights missing from the UC Volume below are downloaded from Hugging
+# MAGIC Face on the first run.
 # MAGIC
-# MAGIC **Stage** (widget / job parameter): `deploy` runs everything; `verify` stops after the
-# MAGIC in-notebook test, without registering the model or touching the endpoint.
+# MAGIC Widgets (job parameters): **catalog** and **schema** pick the Unity Catalog schema for the
+# MAGIC model and its weights. **stage** `deploy` runs everything; `verify` stops after the in-notebook
+# MAGIC test, without registering the model or touching the endpoint.
 
 # COMMAND ----------
 
@@ -23,8 +25,8 @@
 
 # MAGIC %md
 # MAGIC ## Set up the environment
-# MAGIC The custom-LLM starter's install set, proven on this workspace. `env_pack` packages this
-# MAGIC environment with the model; the proxy's own deps (fastapi/uvicorn/httpx) ship with it.
+# MAGIC Pinned to the versions the endpoint runs on. `env_pack` packages this environment with the
+# MAGIC model, so serving gets the same packages, including the proxy's (fastapi/uvicorn/httpx).
 
 # COMMAND ----------
 
@@ -50,12 +52,16 @@ try:
 except OSError:
     raise RuntimeError("No GPU found. Run this on Serverless GPU with an A10.") from None
 
+dbutils.widgets.text("catalog", "", "Catalog")
+dbutils.widgets.text("schema", "", "Schema")
 dbutils.widgets.dropdown("stage", "deploy", ["deploy", "verify"], "Stage")
 STAGE = dbutils.widgets.get("stage")
 
 # Unity Catalog destination; the weights live in the Volume (downloaded on the first run).
-CATALOG = "classic_stable_h0vpq7_catalog"
-SCHEMA = "default"
+CATALOG = dbutils.widgets.get("catalog").strip()
+SCHEMA = dbutils.widgets.get("schema").strip()
+if not (CATALOG and SCHEMA):
+    raise ValueError("Set the catalog and schema widgets (job parameters) to a schema you can create models and volumes in.")
 MODEL_NAME = "multi_lora_vllm"
 VOLUME = "weights"
 
@@ -67,15 +73,13 @@ _WEIGHTS = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}/{MODEL_NAME}"
 WEIGHTS = {
     "base": f"{_WEIGHTS}/base",
     "ner": f"{_WEIGHTS}/adapters/ner",
-    "code": f"{_WEIGHTS}/adapters/code",
 }
-ADAPTERS = ["ner", "code"]
+ADAPTERS = ["ner"]
 
 # Hugging Face source of each, downloaded into the Volume only when it's missing there.
 HF_REPOS = {
     "base": "mistralai/Mistral-7B-Instruct-v0.2",
     "ner": "predibase/Mistral-7B-Instruct-v0.2-conllpp-medusa-lora",
-    "code": "predibase/Mistral-7B-Instruct-v0.2-magicoder-medusa-lora",
 }
 
 # The proxy ships in this bundle's serving/ dir; the notebook runs from notebooks/.
@@ -84,7 +88,7 @@ PROXY_DIR = os.path.abspath("../serving")
 # vLLM tuning.
 SERVED_MODEL_NAME = "base"
 DTYPE = "half"
-MAX_LORAS = 2
+MAX_LORAS = len(ADAPTERS)  # keep every adapter loaded on the GPU
 MAX_LORA_RANK = 16
 
 # Serving endpoint. Custom LLM endpoints don't autoscale: workload_size fixes the replica count.
@@ -176,8 +180,8 @@ for name in WEIGHTS:
 # MAGIC %md
 # MAGIC ## Stage the artifacts on local disk
 # MAGIC Mirror the serving container's artifacts dir on local disk (`/Workspace` doesn't take multi-GB
-# MAGIC files). The base carries redundant `.bin` weights next to its `.safetensors`; copy safetensors
-# MAGIC only so the bundle isn't doubled.
+# MAGIC files). Only the base's `.safetensors` are copied, so `.bin` duplicates in the Volume don't
+# MAGIC double the bundle.
 
 # COMMAND ----------
 
@@ -212,7 +216,15 @@ import time
 import requests
 
 URL = "http://localhost:3080"
-TEST_PROMPT = "Tim Cook said Apple will open a new campus in Austin, Texas. Who and what are mentioned?"
+# The prompt format the ner adapter was trained on (including its double space), so the base
+# model's reply and the adapter's can be compared.
+TEST_PROMPT = (
+    "Your task is a Named Entity Recognition (NER) task. Predict the category of each entity, then place the "
+    "entity into the list associated with the  category in an output JSON payload. Below is an example:\n"
+    'Input: EU rejects German call to boycott British lamb . Output: {"person": [], "organization": ["EU"], '
+    '"location": [], "miscellaneous": ["German", "British"]}\nNow, complete the task.\n'
+    "Input: The Chevrolet Silverado EV is built at GM's Factory Zero plant in Hamtramck, Michigan. Output: "
+)
 LOG = f"{tempfile.gettempdir()}/entrypoint.log"
 
 
@@ -252,7 +264,7 @@ try:
     print("served models:", [m["id"] for m in models.json()["data"]])
 
     for adapter in [None, *ADAPTERS]:
-        request = {"messages": [{"role": "user", "content": TEST_PROMPT}], "max_tokens": 128}
+        request = {"messages": [{"role": "user", "content": TEST_PROMPT}], "max_tokens": 128, "temperature": 0}
         if adapter:
             request["custom_inputs"] = {"adapter": adapter}
         reply = requests.post(URL + "/invocations", json=request, timeout=180)
@@ -407,7 +419,7 @@ print("Endpoint is ready.")
 # COMMAND ----------
 
 for adapter in [None, *ADAPTERS]:
-    request = {"messages": [{"role": "user", "content": TEST_PROMPT}], "max_tokens": 128}
+    request = {"messages": [{"role": "user", "content": TEST_PROMPT}], "max_tokens": 128, "temperature": 0}
     if adapter:
         request["custom_inputs"] = {"adapter": adapter}
     reply = w.api_client.do("POST", f"/serving-endpoints/{ENDPOINT_NAME}/invocations", body=request)

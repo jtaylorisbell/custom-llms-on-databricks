@@ -4,9 +4,13 @@ bundle:
 include:
   - resources/*.yml
 
+variables:
+  catalog:
+    description: Unity Catalog catalog for the registered model and the weights Volume.
+  schema:
+    description: Schema in that catalog.
+
 targets:
   dev:
     default: true
     mode: development
-    workspace:
-      host: https://fevm-classic-stable-h0vpq7.cloud.databricks.com

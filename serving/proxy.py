@@ -142,7 +142,7 @@ class _HttpxUpstream:
         self._base_url = base_url.rstrip("/")
         # No timeout: chat completions (especially streaming) can run for a while. No keep-alive:
         # vLLM closes idle connections after 5s, and reusing one just as it closes fails the
-        # request with ReadError (seen on Model Serving's probes). Loopback connects are cheap.
+        # request with ReadError. Loopback connects are cheap.
         self._client = (
             client
             if client is not None
@@ -302,7 +302,7 @@ def create_proxy_app(
         adapter_names: Allowlist of adapter names that may be requested. Any other
             adapter is rejected with HTTP 400.
         vllm_base_url: Base URL of the upstream vLLM OpenAI server (e.g.
-            ``http://127.0.0.1:8081``). Used to build the default HTTP client.
+            ``http://127.0.0.1:8000``). Used to build the default HTTP client.
         base_model_name: vLLM ``--served-model-name`` of the base weights; requests
             that name no adapter are routed here.
         http_client: Optional upstream client override. Defaults to an
