@@ -5,3 +5,6 @@
 __pycache__/
 *.py[cod]
 .venv/
+
+# Local tool state
+.isaac/
