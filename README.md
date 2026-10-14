@@ -1,4 +1,4 @@
-# multi-adapter-serving
+# Serving LoRA Adapters with Databricks Custom LLM Serving
 
 Serves Mistral-7B-Instruct-v0.2 and `ner`, a LoRA adapter trained on it for entity extraction, from
 one Databricks [custom LLM serving](https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms)
@@ -17,7 +17,7 @@ client --custom_inputs.adapter="ner"--> proxy :8080 --model="ner"--> vLLM (base 
 ## Layout
 
 - `notebooks/register.py`: downloads any missing weights, tests the serving command, registers the
-  model in Unity Catalog, and creates or updates the endpoint.
+model in Unity Catalog, and creates or updates the endpoint.
 - `serving/`: the proxy and its launcher, bundled into the model with the weights.
 - `resources/multi_lora.job.yml`: the Serverless GPU (A10) job that runs the notebook.
 - `scripts/smoke_test.py`: queries the base model and each adapter over OAuth.
@@ -46,11 +46,11 @@ To keep the catalog and schema between shells, put them in
 Each run (`stage=verify` stops after step 2):
 
 1. Downloads any weights missing from `/Volumes/<catalog>/<schema>/weights/multi_lora_vllm/` from
-   Hugging Face (about 14 GB the first time, no token needed).
+ Hugging Face (about 14 GB the first time, no token needed).
 2. Runs the serving command in the notebook and checks that the base model and each adapter answer.
 3. Registers a new version of `<catalog>.<schema>.multi_lora_vllm`.
 4. Creates the `multi-lora-vllm` endpoint, or moves it to the new version while the current one
-   keeps serving.
+ keeps serving.
 
 A full run takes about 30 minutes.
 
@@ -119,19 +119,8 @@ always gets the base model.
 ## Add an adapter
 
 1. In `notebooks/register.py`, add its name to `ADAPTERS`, its Volume path to `WEIGHTS`, and its
-   Hugging Face repo to `HF_REPOS` (or copy it into the Volume yourself). It must be a LoRA trained
-   on the same base model.
+ Hugging Face repo to `HF_REPOS` (or copy it into the Volume yourself). It must be a LoRA trained
+ on the same base model.
 2. Keep `MAX_LORA_RANK` at or above its rank (`r` in its `adapter_config.json`).
 3. Rerun the job. The notebook test checks the new adapter before anything is registered.
 
-## Cost
-
-Scale-to-zero is off, so the endpoint bills for its GPU around the clock (about 20 DBU/hour) until
-you delete it:
-
-```bash
-databricks serving-endpoints delete multi-lora-vllm
-```
-
-To stop idle billing instead, set `SCALE_TO_ZERO_ENABLED = True` in the notebook and rerun the job.
-The first request after an idle period then waits several minutes while the model loads.
